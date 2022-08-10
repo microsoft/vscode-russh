@@ -45,6 +45,8 @@ pub const RSA_SHA2_512: Name = Name("rsa-sha2-512");
 /// The name of the ssh-sha2-256 algorithm for SSH.
 pub const RSA_SHA2_256: Name = Name("rsa-sha2-256");
 
+pub const NONE: Name = Name("none");
+
 pub const SSH_RSA: Name = Name("ssh-rsa");
 
 impl Name {
@@ -427,7 +429,7 @@ fn rsa_signature(
 }
 
 /// Parse a public key from a byte slice.
-pub fn parse_public_key(p: &[u8], prefer_hash: Option<SignatureHash>) -> Result<PublicKey, Error> {
+pub fn parse_public_key(p: &[u8], _prefer_hash: Option<SignatureHash>) -> Result<PublicKey, Error> {
     let mut pos = p.reader(0);
     let t = pos.read_string()?;
     if t == b"ssh-ed25519" {

@@ -692,7 +692,7 @@ async fn reply<H: Handler>(
                 }
                 // Ok, NEWKEYS received, now encrypted.
                 session.common.encrypted(
-                    EncryptedState::WaitingServiceRequest {
+                    EncryptedState::WaitingAuthServiceRequest {
                         sent: false,
                         accepted: false,
                     },
