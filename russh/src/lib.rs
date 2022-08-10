@@ -321,6 +321,7 @@ macro_rules! push_packet {
 }
 
 mod session;
+mod parsing;
 
 /// Server side of this library.
 pub mod server;

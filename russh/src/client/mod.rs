@@ -412,6 +412,39 @@ impl<H: Handler> Handle<H> {
         self.wait_channel_confirmation(receiver).await
     }
 
+    /// Send data to the session referenced by this handler.
+    ///
+    /// This is useful for server-initiated channels; for channels created by
+    /// the client, prefer to use the Channel returned from the `open_*` methods.
+    pub async fn data(&self, id: ChannelId, data: CryptoVec) -> Result<(), CryptoVec> {
+        self.sender
+            .send(Msg::Data { id, data })
+            .await
+            .map_err(|e| match e.0 {
+                Msg::Data { data, .. } => data,
+                _ => unreachable!(),
+            })
+    }
+
+    /// Send data to the session referenced by this handler.
+    ///
+    /// This is useful for server-initiated channels; for channels created by
+    /// the client, prefer to use the Channel returned from the `open_*` methods.
+    pub async fn extended_data(
+        &self,
+        id: ChannelId,
+        ext: u32,
+        data: CryptoVec,
+    ) -> Result<(), CryptoVec> {
+        self.sender
+            .send(Msg::ExtendedData { id, data, ext })
+            .await
+            .map_err(|e| match e.0 {
+                Msg::Data { data, .. } => data,
+                _ => unreachable!(),
+            })
+    }
+
     /// Sends a disconnect message.
     pub async fn disconnect(
         &mut self,
@@ -1386,13 +1419,53 @@ pub trait Handler: Sized {
         self.finished(session)
     }
 
-    /// Called when a new channel is created.
+    /// Called when a port foward request is made on a channel.
     #[allow(unused_variables)]
     fn channel_open_forwarded_tcpip(
         self,
         channel: ChannelId,
         connected_address: &str,
         connected_port: u32,
+        originator_address: &str,
+        originator_port: u32,
+        session: Session,
+    ) -> Self::FutureUnit {
+        self.finished(session)
+    }
+
+    /// Called when the server gets an unknown channel. It may return `true`,
+    /// if the channel of unknown type should be handled. If it returns `false`,
+    /// the channel will not be created and an error will be sent to the server.
+    #[allow(unused_variables)]
+    fn server_channel_handle_unknown(&self, channel: ChannelId, channel_type: &[u8]) -> bool {
+        false
+    }
+
+    /// Called when the server opens a session channel.
+    #[allow(unused_variables)]
+    fn server_channel_open_session(self, channel: ChannelId, session: Session) -> Self::FutureUnit {
+        self.finished(session)
+    }
+
+    /// Called when the server opens a direct tcp/ip channel.
+    #[allow(unused_variables)]
+    fn server_channel_open_direct_tcpip(
+        self,
+        channel: ChannelId,
+        host_to_connect: &str,
+        port_to_connect: u32,
+        originator_address: &str,
+        originator_port: u32,
+        session: Session,
+    ) -> Self::FutureUnit {
+        self.finished(session)
+    }
+
+    /// Called when the server opens an X11 channel.
+    #[allow(unused_variables)]
+    fn server_channel_open_x11(
+        self,
+        channel: ChannelId,
         originator_address: &str,
         originator_port: u32,
         session: Session,

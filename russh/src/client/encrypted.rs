@@ -20,8 +20,9 @@ use russh_keys::encoding::{Encoding, Reader};
 use super::{Msg, Reply};
 use crate::key::PubKey;
 use crate::negotiation::{Named, Select};
-use crate::session::*;
+use crate::parsing::{ChannelType, OpenChannelMessage};
 use crate::{auth, msg, negotiation, ChannelId, ChannelOpenFailure, Error, Sig};
+use crate::{session::*, Channel};
 
 thread_local! {
     static SIGNATURE_BUFFER: RefCell<CryptoVec> = RefCell::new(CryptoVec::new());
@@ -494,6 +495,86 @@ impl super::Session {
                 let mut r = buf.reader(1);
                 let channel_num = ChannelId(r.read_u32().map_err(crate::Error::from)?);
                 client.channel_success(channel_num, self).await
+            }
+            Some(&msg::CHANNEL_OPEN) => {
+                let mut r = buf.reader(1);
+                let msg = OpenChannelMessage::parse(&mut r)?;
+
+                if let Some(ref mut enc) = self.common.encrypted {
+                    let id = enc.new_channel_id();
+                    let channel = Channel {
+                        recipient_channel: msg.recipient_channel,
+                        sender_channel: id,
+                        recipient_window_size: msg.recipient_window_size,
+                        sender_window_size: self.common.config.window_size,
+                        recipient_maximum_packet_size: msg.recipient_maximum_packet_size,
+                        sender_maximum_packet_size: self.common.config.maximum_packet_size,
+                        confirmed: true,
+                        wants_reply: false,
+                        pending_data: std::collections::VecDeque::new(),
+                    };
+
+                    let confirm = || {
+                        debug!("confirming channel: {:?}", msg);
+                        msg.confirm(
+                            &mut enc.write,
+                            id.0,
+                            channel.sender_window_size,
+                            channel.sender_maximum_packet_size,
+                        );
+                        enc.channels.insert(id, channel);
+                    };
+
+                    Ok(match &msg.typ {
+                        ChannelType::Session => {
+                            confirm();
+                            client.server_channel_open_session(id, self).await?
+                        }
+                        ChannelType::DirectTcpip {
+                            host_to_connect,
+                            port_to_connect,
+                            originator_address,
+                            originator_port,
+                        } => {
+                            confirm();
+                            client
+                                .server_channel_open_direct_tcpip(
+                                    id,
+                                    host_to_connect,
+                                    *port_to_connect,
+                                    originator_address,
+                                    *originator_port,
+                                    self,
+                                )
+                                .await?
+                        }
+                        ChannelType::X11 {
+                            originator_address,
+                            originator_port,
+                        } => {
+                            confirm();
+                            client
+                                .server_channel_open_x11(
+                                    id,
+                                    originator_address,
+                                    *originator_port,
+                                    self,
+                                )
+                                .await?
+                        }
+                        ChannelType::Unknown { typ } => {
+                            if client.server_channel_handle_unknown(id, &typ) {
+                                confirm();
+                            } else {
+                                debug!("unknown channel type: {}", String::from_utf8_lossy(typ));
+                                msg.unknown_type(&mut enc.write);
+                            }
+                            (client, self)
+                        }
+                    })
+                } else {
+                    Err(Error::Inconsistent.into())
+                }
             }
             _ => {
                 info!("Unhandled packet: {:?}", buf);

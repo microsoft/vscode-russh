@@ -535,3 +535,4 @@ pub struct NewKeys {
     pub received: bool,
     pub sent: bool,
 }
+
