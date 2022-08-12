@@ -22,7 +22,7 @@ use crate::key::PubKey;
 use crate::negotiation::{Named, Select};
 use crate::parsing::{ChannelType, OpenChannelMessage};
 use crate::{auth, msg, negotiation, ChannelId, ChannelOpenFailure, Error, Sig};
-use crate::{session::*, Channel};
+use crate::{session::*, ChannelParams};
 
 thread_local! {
     static SIGNATURE_BUFFER: RefCell<CryptoVec> = RefCell::new(CryptoVec::new());
@@ -502,7 +502,7 @@ impl super::Session {
 
                 if let Some(ref mut enc) = self.common.encrypted {
                     let id = enc.new_channel_id();
-                    let channel = Channel {
+                    let channel = ChannelParams {
                         recipient_channel: msg.recipient_channel,
                         sender_channel: id,
                         recipient_window_size: msg.recipient_window_size,

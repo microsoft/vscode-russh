@@ -360,4 +360,13 @@ impl Session {
             0
         }
     }
+
+    pub(crate) fn unimplemented(&mut self, packet_id: u32) {
+        if let Some(ref mut enc) = self.common.encrypted {
+            push_packet!(enc.write, {
+                enc.write.push(msg::UNIMPLEMENTED);
+                enc.write.push_u32_be(packet_id);
+            });
+        }
+    }
 }

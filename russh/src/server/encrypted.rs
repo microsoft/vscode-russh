@@ -150,13 +150,15 @@ impl Session {
                 Ok((handler, self))
             }
             EncryptedState::WaitingAuthRequest(_) if buf.get(0) == Some(&msg::USERAUTH_REQUEST) => {
-                let h = enc
+                handler = enc
                     .server_read_auth_request(instant, handler, buf, &mut self.common.auth_user)
                     .await?;
                 if let EncryptedState::InitCompression = enc.state {
                     enc.client_compression.init_decompress(&mut enc.decompress);
+                    handler.auth_succeeded(self).await
+                } else {
+                    Ok((handler, self))
                 }
-                Ok((h, self))
             }
             EncryptedState::WaitingAuthRequest(ref mut auth)
                 if buf.get(0) == Some(&msg::USERAUTH_INFO_RESPONSE) =>
@@ -801,7 +803,7 @@ impl Session {
         } else {
             unreachable!()
         };
-        let channel = Channel {
+        let channel = ChannelParams {
             recipient_channel: msg.recipient_channel,
 
             // "sender" is the local end, i.e. we're the sender, the remote is the recipient.
