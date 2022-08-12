@@ -315,15 +315,13 @@ impl<Send: From<(ChannelId, ChannelMsg)>> Channel<Send> {
 
     /// Wait for data to come.
     pub async fn wait(&mut self) -> Option<ChannelMsg> {
-        loop {
-            match self.receiver.recv().await {
-                Some(ChannelMsg::WindowAdjusted { new_size }) => {
-                    self.window_size += new_size;
-                    return Some(ChannelMsg::WindowAdjusted { new_size });
-                }
-                Some(msg) => return Some(msg),
-                None => return None,
+        match self.receiver.recv().await {
+            Some(ChannelMsg::WindowAdjusted { new_size }) => {
+                self.window_size += new_size;
+                Some(ChannelMsg::WindowAdjusted { new_size })
             }
+            Some(msg) => Some(msg),
+            None => None,
         }
     }
 

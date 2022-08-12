@@ -702,7 +702,7 @@ mod test_compress {
         channel.data(data).await.unwrap();
         let msg = channel.wait().await.unwrap();
         match msg {
-            ChannelMsg::Data { data: msg_data } => {
+            channels::ChannelMsg::Data { data: msg_data } => {
                 assert_eq!(*data, *msg_data)
             }
             msg => panic!("Unexpected message {:?}", msg),

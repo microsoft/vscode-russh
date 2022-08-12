@@ -571,7 +571,7 @@ impl super::Session {
                                 .await?
                         }
                         ChannelType::Unknown { typ } => {
-                            if client.server_channel_handle_unknown(id, &typ) {
+                            if client.server_channel_handle_unknown(id, typ) {
                                 confirm();
                             } else {
                                 debug!("unknown channel type: {}", String::from_utf8_lossy(typ));

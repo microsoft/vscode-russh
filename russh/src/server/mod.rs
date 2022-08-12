@@ -526,7 +526,6 @@ where
     let (sender, receiver) = tokio::sync::mpsc::channel(10);
     let handle = server::session::Handle { sender };
     let session = Session {
-        session_id: get_session_id(),
         target_window_size: common.config.window_size,
         common,
         receiver,

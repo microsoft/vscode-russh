@@ -389,7 +389,7 @@ pub enum EncryptedState {
     Authenticated,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Exchange {
     pub client_id: CryptoVec,
     pub server_id: CryptoVec,
