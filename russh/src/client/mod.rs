@@ -1057,6 +1057,20 @@ pub trait Handler: Sized {
         self.finished(session)
     }
 
+    /// Called when the server opens a forwarded tcp/ip channel.
+    #[allow(unused_variables)]
+    fn server_channel_open_forwarded_tcpip(
+        self,
+        channel: ChannelId,
+        host_to_connect: &str,
+        port_to_connect: u32,
+        originator_address: &str,
+        originator_port: u32,
+        session: Session,
+    ) -> Self::FutureUnit {
+        self.finished(session)
+    }
+
     /// Called when the server opens an X11 channel.
     #[allow(unused_variables)]
     fn server_channel_open_x11(

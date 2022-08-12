@@ -41,7 +41,22 @@ pub enum Msg {
     ChannelOpenSession {
         sender: UnboundedSender<ChannelMsg>,
     },
+    TcpIpForward {
+        address: String,
+        port: u32,
+    },
+    CancelTcpIpForward {
+        address: String,
+        port: u32,
+    },
     ChannelOpenDirectTcpIp {
+        host_to_connect: String,
+        port_to_connect: u32,
+        originator_address: String,
+        originator_port: u32,
+        sender: UnboundedSender<ChannelMsg>,
+    },
+    ChannelOpenForwardedTcpIp {
         host_to_connect: String,
         port_to_connect: u32,
         originator_address: String,
@@ -134,6 +149,22 @@ impl Handle {
             .map_err(|_| ())
     }
 
+    /// Notifies the client that it can open TCP/IP forwarding channels for a port.
+    pub async fn forward_tcpip(&mut self, address: String, port: u32) -> Result<(), ()> {
+        self.sender
+            .send(Msg::TcpIpForward { address, port })
+            .await
+            .map_err(|_| ())
+    }
+
+    /// Notifies the client that it can no longer open TCP/IP forwarding channel for a port.
+    pub async fn cancel_forward_tcpip(&mut self, address: String, port: u32) -> Result<(), ()> {
+        self.sender
+            .send(Msg::CancelTcpIpForward { address, port })
+            .await
+            .map_err(|_| ())
+    }
+
     /// Request a session channel (the most basic type of
     /// channel). This function returns `Some(..)` immediately if the
     /// connection is authenticated, but the channel only becomes
@@ -163,6 +194,32 @@ impl Handle {
         let (sender, receiver) = unbounded_channel();
         self.sender
             .send(Msg::ChannelOpenDirectTcpIp {
+                host_to_connect: host_to_connect.into(),
+                port_to_connect,
+                originator_address: originator_address.into(),
+                originator_port,
+                sender,
+            })
+            .await
+            .map_err(|_| Error::SendError)?;
+        self.wait_channel_confirmation(receiver).await
+    }
+
+    /// Open a TCP/IP forwarding channel. This is usually done when a
+    /// connection comes to a locally forwarded TCP/IP port. See
+    /// [RFC4254](https://tools.ietf.org/html/rfc4254#section-7). The
+    /// TCP/IP packets can then be tunneled through the channel using
+    /// `.data()`.
+    pub async fn channel_open_forwarded_tcpip<A: Into<String>, B: Into<String>>(
+        &mut self,
+        host_to_connect: A,
+        port_to_connect: u32,
+        originator_address: B,
+        originator_port: u32,
+    ) -> Result<Channel<Msg>, Error> {
+        let (sender, receiver) = unbounded_channel();
+        self.sender
+            .send(Msg::ChannelOpenForwardedTcpIp {
                 host_to_connect: host_to_connect.into(),
                 port_to_connect,
                 originator_address: originator_address.into(),
@@ -355,6 +412,16 @@ impl Session {
                             let id = self.channel_open_direct_tcpip(&host_to_connect, port_to_connect, &originator_address, originator_port)?;
                             self.channels.insert(id, sender);
                         }
+                        Some(Msg::ChannelOpenForwardedTcpIp { host_to_connect, port_to_connect, originator_address, originator_port, sender }) => {
+                            let id = self.channel_open_forwarded_tcpip(&host_to_connect, port_to_connect, &originator_address, originator_port)?;
+                            self.channels.insert(id, sender);
+                        }
+                        Some(Msg::TcpIpForward { address, port }) => {
+                            self.tcpip_forward(false, &address, port);
+                        },
+                        Some(Msg::CancelTcpIpForward { address, port }) => {
+                            self.cancel_tcpip_forward(false, &address, port);
+                        },
                         Some(_) => {
                             debug!("unimplemented (intended for client?) message: {:?}", msg);
                             self.unimplemented(0);
@@ -714,6 +781,7 @@ impl Session {
             ) {
                 return Err(Error::Inconsistent);
             }
+
             let sender_channel = enc.new_channel(
                 self.common.config.window_size,
                 self.common.config.maximum_packet_size,
@@ -742,7 +810,6 @@ impl Session {
         } else {
             return Err(Error::Inconsistent);
         };
-
         Ok(result)
     }
 
@@ -765,8 +832,8 @@ impl Session {
             ) {
                 return Err(Error::Inconsistent);
             }
-
             debug!("sending open request");
+
             let sender_channel = enc.new_channel(
                 self.common.config.window_size,
                 self.common.config.maximum_packet_size,
@@ -796,5 +863,38 @@ impl Session {
             return Err(Error::Inconsistent);
         };
         Ok(result)
+    }
+
+    pub fn tcpip_forward(&mut self, want_reply: bool, address: &str, port: u32) {
+        if let Some(ref mut enc) = self.common.encrypted {
+            push_packet!(enc.write, {
+                enc.write.push(msg::GLOBAL_REQUEST);
+                enc.write.extend_ssh_string(b"tcpip-forward");
+                enc.write.push(if want_reply { 1 } else { 0 });
+                enc.write.extend_ssh_string(address.as_bytes());
+                enc.write.push_u32_be(port);
+            });
+        }
+    }
+
+    pub fn cancel_tcpip_forward(&mut self, want_reply: bool, address: &str, port: u32) {
+        if let Some(ref mut enc) = self.common.encrypted {
+            push_packet!(enc.write, {
+                enc.write.push(msg::GLOBAL_REQUEST);
+                enc.write.extend_ssh_string(b"cancel-tcpip-forward");
+                enc.write.push(if want_reply { 1 } else { 0 });
+                enc.write.extend_ssh_string(address.as_bytes());
+                enc.write.push_u32_be(port);
+            });
+        }
+    }
+
+    fn unimplemented(&mut self, packet_id: u32) {
+        if let Some(ref mut enc) = self.common.encrypted {
+            push_packet!(enc.write, {
+                enc.write.push(msg::UNIMPLEMENTED);
+                enc.write.push_u32_be(packet_id);
+            });
+        }
     }
 }

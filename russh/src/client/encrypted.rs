@@ -530,20 +530,28 @@ impl super::Session {
                             confirm();
                             client.server_channel_open_session(id, self).await?
                         }
-                        ChannelType::DirectTcpip {
-                            host_to_connect,
-                            port_to_connect,
-                            originator_address,
-                            originator_port,
-                        } => {
+                        ChannelType::DirectTcpip(d) => {
                             confirm();
                             client
                                 .server_channel_open_direct_tcpip(
                                     id,
-                                    host_to_connect,
-                                    *port_to_connect,
-                                    originator_address,
-                                    *originator_port,
+                                    &d.host_to_connect,
+                                    d.port_to_connect,
+                                    &d.originator_address,
+                                    d.originator_port,
+                                    self,
+                                )
+                                .await?
+                        }
+                        ChannelType::ForwardedTcpIp(d) => {
+                            confirm();
+                            client
+                                .server_channel_open_direct_tcpip(
+                                    id,
+                                    &d.host_to_connect,
+                                    d.port_to_connect,
+                                    &d.originator_address,
+                                    d.originator_port,
                                     self,
                                 )
                                 .await?
