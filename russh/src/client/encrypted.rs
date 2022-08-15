@@ -22,7 +22,7 @@ use crate::key::PubKey;
 use crate::negotiation::{Named, Select};
 use crate::parsing::{ChannelType, OpenChannelMessage};
 use crate::{auth, msg, negotiation, ChannelId, ChannelOpenFailure, Error, Sig};
-use crate::{session::*, Channel};
+use crate::{session::*, ChannelParams};
 
 thread_local! {
     static SIGNATURE_BUFFER: RefCell<CryptoVec> = RefCell::new(CryptoVec::new());
@@ -502,7 +502,7 @@ impl super::Session {
 
                 if let Some(ref mut enc) = self.common.encrypted {
                     let id = enc.new_channel_id();
-                    let channel = Channel {
+                    let channel = ChannelParams {
                         recipient_channel: msg.recipient_channel,
                         sender_channel: id,
                         recipient_window_size: msg.recipient_window_size,
@@ -530,20 +530,28 @@ impl super::Session {
                             confirm();
                             client.server_channel_open_session(id, self).await?
                         }
-                        ChannelType::DirectTcpip {
-                            host_to_connect,
-                            port_to_connect,
-                            originator_address,
-                            originator_port,
-                        } => {
+                        ChannelType::DirectTcpip(d) => {
                             confirm();
                             client
                                 .server_channel_open_direct_tcpip(
                                     id,
-                                    host_to_connect,
-                                    *port_to_connect,
-                                    originator_address,
-                                    *originator_port,
+                                    &d.host_to_connect,
+                                    d.port_to_connect,
+                                    &d.originator_address,
+                                    d.originator_port,
+                                    self,
+                                )
+                                .await?
+                        }
+                        ChannelType::ForwardedTcpIp(d) => {
+                            confirm();
+                            client
+                                .server_channel_open_direct_tcpip(
+                                    id,
+                                    &d.host_to_connect,
+                                    d.port_to_connect,
+                                    &d.originator_address,
+                                    d.originator_port,
                                     self,
                                 )
                                 .await?
@@ -563,7 +571,7 @@ impl super::Session {
                                 .await?
                         }
                         ChannelType::Unknown { typ } => {
-                            if client.server_channel_handle_unknown(id, &typ) {
+                            if client.server_channel_handle_unknown(id, typ) {
                                 confirm();
                             } else {
                                 debug!("unknown channel type: {}", String::from_utf8_lossy(typ));

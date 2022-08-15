@@ -150,13 +150,15 @@ impl Session {
                 Ok((handler, self))
             }
             EncryptedState::WaitingAuthRequest(_) if buf.get(0) == Some(&msg::USERAUTH_REQUEST) => {
-                let h = enc
+                handler = enc
                     .server_read_auth_request(instant, handler, buf, &mut self.common.auth_user)
                     .await?;
                 if let EncryptedState::InitCompression = enc.state {
                     enc.client_compression.init_decompress(&mut enc.decompress);
+                    handler.auth_succeeded(self).await
+                } else {
+                    Ok((handler, self))
                 }
-                Ok((h, self))
             }
             EncryptedState::WaitingAuthRequest(ref mut auth)
                 if buf.get(0) == Some(&msg::USERAUTH_INFO_RESPONSE) =>
@@ -263,6 +265,24 @@ impl Encrypted {
             } else if method == b"publickey" {
                 self.server_read_auth_request_pk(until, handler, buf, auth_user, user, r)
                     .await
+            } else if method == b"none" {
+                let auth_request = if let EncryptedState::WaitingAuthRequest(ref mut a) = self.state
+                {
+                    a
+                } else {
+                    unreachable!()
+                };
+                let (handler, auth) = handler.auth_none(user).await?;
+                if let Auth::Accept = auth {
+                    server_auth_request_success(&mut self.write);
+                    self.state = EncryptedState::InitCompression;
+                } else {
+                    auth_user.clear();
+                    auth_request.methods -= MethodSet::NONE;
+                    auth_request.partial_success = false;
+                    reject_auth_request(until, &mut self.write, auth_request).await;
+                }
+                Ok(handler)
             } else if method == b"keyboard-interactive" {
                 let auth_request = if let EncryptedState::WaitingAuthRequest(ref mut a) = self.state
                 {
@@ -801,7 +821,7 @@ impl Session {
         } else {
             unreachable!()
         };
-        let channel = Channel {
+        let channel = ChannelParams {
             recipient_channel: msg.recipient_channel,
 
             // "sender" is the local end, i.e. we're the sender, the remote is the recipient.
@@ -825,28 +845,45 @@ impl Session {
                 originator_address,
                 originator_port,
             } => {
-                self.confirm_channel_open(&msg, channel);
-                handler
+                let mut result = handler
                     .channel_open_x11(sender_channel, originator_address, *originator_port, self)
-                    .await
+                    .await;
+                if let Ok((_, s)) = &mut result {
+                    s.confirm_channel_open(&msg, channel);
+                }
+                result
             }
-            ChannelType::DirectTcpip {
-                host_to_connect,
-                port_to_connect,
-                originator_address,
-                originator_port,
-            } => {
-                self.confirm_channel_open(&msg, channel);
-                handler
+            ChannelType::DirectTcpip(d) => {
+                let mut result = handler
                     .channel_open_direct_tcpip(
                         sender_channel,
-                        host_to_connect,
-                        *port_to_connect,
-                        originator_address,
-                        *originator_port,
+                        &d.host_to_connect,
+                        d.port_to_connect,
+                        &d.originator_address,
+                        d.originator_port,
                         self,
                     )
-                    .await
+                    .await;
+                if let Ok((_, s)) = &mut result {
+                    s.confirm_channel_open(&msg, channel);
+                }
+                result
+            }
+            ChannelType::ForwardedTcpIp(d) => {
+                let mut result = handler
+                    .channel_open_forwarded_tcpip(
+                        sender_channel,
+                        &d.host_to_connect,
+                        d.port_to_connect,
+                        &d.originator_address,
+                        d.originator_port,
+                        self,
+                    )
+                    .await;
+                if let Ok((_, s)) = &mut result {
+                    s.confirm_channel_open(&msg, channel);
+                }
+                result
             }
             ChannelType::Unknown { typ } => {
                 debug!("unknown channel type: {}", String::from_utf8_lossy(typ));
@@ -859,7 +896,7 @@ impl Session {
         }
     }
 
-    fn confirm_channel_open(&mut self, open: &OpenChannelMessage, channel: Channel) {
+    fn confirm_channel_open(&mut self, open: &OpenChannelMessage, channel: ChannelParams) {
         if let Some(ref mut enc) = self.common.encrypted {
             open.confirm(
                 &mut enc.write,

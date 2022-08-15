@@ -1,36 +1,79 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use russh_keys::encoding::Encoding;
-use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::mpsc::{Receiver, Sender, UnboundedReceiver};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
+    sync::mpsc::{unbounded_channel, UnboundedSender},
+};
 
 use super::*;
-use crate::msg;
+use crate::{
+    channels::{Channel, ChannelMsg},
+    msg,
+};
 
 /// A connected server session. This type is unique to a client.
 pub struct Session {
     pub(crate) common: CommonSession<Arc<Config>>,
     pub(crate) sender: Handle,
-    pub(crate) receiver: Receiver<(ChannelId, ChannelMsg)>,
+    pub(crate) receiver: Receiver<Msg>,
     pub(crate) target_window_size: u32,
     pub(crate) pending_reads: Vec<CryptoVec>,
     pub(crate) pending_len: u32,
+    pub(crate) channels: HashMap<ChannelId, UnboundedSender<ChannelMsg>>,
+}
+#[derive(Debug)]
+pub enum Msg {
+    ChannelOpenSession {
+        sender: UnboundedSender<ChannelMsg>,
+    },
+    TcpIpForward {
+        address: String,
+        port: u32,
+    },
+    CancelTcpIpForward {
+        address: String,
+        port: u32,
+    },
+    ChannelOpenDirectTcpIp {
+        host_to_connect: String,
+        port_to_connect: u32,
+        originator_address: String,
+        originator_port: u32,
+        sender: UnboundedSender<ChannelMsg>,
+    },
+    ChannelOpenForwardedTcpIp {
+        host_to_connect: String,
+        port_to_connect: u32,
+        originator_address: String,
+        originator_port: u32,
+        sender: UnboundedSender<ChannelMsg>,
+    },
+    Channel(ChannelId, ChannelMsg),
+}
+
+impl From<(ChannelId, ChannelMsg)> for Msg {
+    fn from((id, msg): (ChannelId, ChannelMsg)) -> Self {
+        Msg::Channel(id, msg)
+    }
 }
 
 #[derive(Clone)]
 /// Handle to a session, used to send messages to a client outside of
 /// the request/response cycle.
 pub struct Handle {
-    pub(crate) sender: Sender<(ChannelId, ChannelMsg)>,
+    pub(crate) sender: Sender<Msg>,
 }
 
 impl Handle {
     /// Send data to the session referenced by this handler.
     pub async fn data(&mut self, id: ChannelId, data: CryptoVec) -> Result<(), CryptoVec> {
         self.sender
-            .send((id, ChannelMsg::Data { data }))
+            .send(Msg::Channel(id, ChannelMsg::Data { data }))
             .await
             .map_err(|e| match e.0 {
-                (_, ChannelMsg::Data { data }) => data,
+                Msg::Channel(_, ChannelMsg::Data { data }) => data,
                 _ => unreachable!(),
             })
     }
@@ -43,10 +86,10 @@ impl Handle {
         data: CryptoVec,
     ) -> Result<(), CryptoVec> {
         self.sender
-            .send((id, ChannelMsg::ExtendedData { ext, data }))
+            .send(Msg::Channel(id, ChannelMsg::ExtendedData { ext, data }))
             .await
             .map_err(|e| match e.0 {
-                (_, ChannelMsg::ExtendedData { data, .. }) => data,
+                Msg::Channel(_, ChannelMsg::ExtendedData { data, .. }) => data,
                 _ => unreachable!(),
             })
     }
@@ -54,7 +97,7 @@ impl Handle {
     /// Send EOF to the session referenced by this handler.
     pub async fn eof(&mut self, id: ChannelId) -> Result<(), ()> {
         self.sender
-            .send((id, ChannelMsg::Eof))
+            .send(Msg::Channel(id, ChannelMsg::Eof))
             .await
             .map_err(|_| ())
     }
@@ -62,7 +105,7 @@ impl Handle {
     /// Send success to the session referenced by this handler.
     pub async fn channel_success(&mut self, id: ChannelId) -> Result<(), ()> {
         self.sender
-            .send((id, ChannelMsg::Success))
+            .send(Msg::Channel(id, ChannelMsg::Success))
             .await
             .map_err(|_| ())
     }
@@ -70,7 +113,7 @@ impl Handle {
     /// Close a channel.
     pub async fn close(&mut self, id: ChannelId) -> Result<(), ()> {
         self.sender
-            .send((id, ChannelMsg::Close))
+            .send(Msg::Channel(id, ChannelMsg::Close))
             .await
             .map_err(|_| ())
     }
@@ -80,7 +123,7 @@ impl Handle {
     /// [RFC4254](https://tools.ietf.org/html/rfc4254#section-6.8).
     pub async fn xon_xoff_request(&mut self, id: ChannelId, client_can_do: bool) -> Result<(), ()> {
         self.sender
-            .send((id, ChannelMsg::XonXoff { client_can_do }))
+            .send(Msg::Channel(id, ChannelMsg::XonXoff { client_can_do }))
             .await
             .map_err(|_| ())
     }
@@ -88,9 +131,120 @@ impl Handle {
     /// Send the exit status of a program.
     pub async fn exit_status_request(&mut self, id: ChannelId, exit_status: u32) -> Result<(), ()> {
         self.sender
-            .send((id, ChannelMsg::ExitStatus { exit_status }))
+            .send(Msg::Channel(id, ChannelMsg::ExitStatus { exit_status }))
             .await
             .map_err(|_| ())
+    }
+
+    /// Notifies the client that it can open TCP/IP forwarding channels for a port.
+    pub async fn forward_tcpip(&mut self, address: String, port: u32) -> Result<(), ()> {
+        self.sender
+            .send(Msg::TcpIpForward { address, port })
+            .await
+            .map_err(|_| ())
+    }
+
+    /// Notifies the client that it can no longer open TCP/IP forwarding channel for a port.
+    pub async fn cancel_forward_tcpip(&mut self, address: String, port: u32) -> Result<(), ()> {
+        self.sender
+            .send(Msg::CancelTcpIpForward { address, port })
+            .await
+            .map_err(|_| ())
+    }
+
+    /// Request a session channel (the most basic type of
+    /// channel). This function returns `Some(..)` immediately if the
+    /// connection is authenticated, but the channel only becomes
+    /// usable when it's confirmed by the server, as indicated by the
+    /// `confirmed` field of the corresponding `Channel`.
+    pub async fn channel_open_session(&mut self) -> Result<Channel<Msg>, Error> {
+        let (sender, receiver) = unbounded_channel();
+        self.sender
+            .send(Msg::ChannelOpenSession { sender })
+            .await
+            .map_err(|_| Error::SendError)?;
+        self.wait_channel_confirmation(receiver).await
+    }
+
+    /// Open a TCP/IP forwarding channel. This is usually done when a
+    /// connection comes to a locally forwarded TCP/IP port. See
+    /// [RFC4254](https://tools.ietf.org/html/rfc4254#section-7). The
+    /// TCP/IP packets can then be tunneled through the channel using
+    /// `.data()`.
+    pub async fn channel_open_direct_tcpip<A: Into<String>, B: Into<String>>(
+        &mut self,
+        host_to_connect: A,
+        port_to_connect: u32,
+        originator_address: B,
+        originator_port: u32,
+    ) -> Result<Channel<Msg>, Error> {
+        let (sender, receiver) = unbounded_channel();
+        self.sender
+            .send(Msg::ChannelOpenDirectTcpIp {
+                host_to_connect: host_to_connect.into(),
+                port_to_connect,
+                originator_address: originator_address.into(),
+                originator_port,
+                sender,
+            })
+            .await
+            .map_err(|_| Error::SendError)?;
+        self.wait_channel_confirmation(receiver).await
+    }
+
+    /// Open a TCP/IP forwarding channel. This is usually done when a
+    /// connection comes to a locally forwarded TCP/IP port. See
+    /// [RFC4254](https://tools.ietf.org/html/rfc4254#section-7). The
+    /// TCP/IP packets can then be tunneled through the channel using
+    /// `.data()`.
+    pub async fn channel_open_forwarded_tcpip<A: Into<String>, B: Into<String>>(
+        &mut self,
+        host_to_connect: A,
+        port_to_connect: u32,
+        originator_address: B,
+        originator_port: u32,
+    ) -> Result<Channel<Msg>, Error> {
+        let (sender, receiver) = unbounded_channel();
+        self.sender
+            .send(Msg::ChannelOpenForwardedTcpIp {
+                host_to_connect: host_to_connect.into(),
+                port_to_connect,
+                originator_address: originator_address.into(),
+                originator_port,
+                sender,
+            })
+            .await
+            .map_err(|_| Error::SendError)?;
+        self.wait_channel_confirmation(receiver).await
+    }
+
+    async fn wait_channel_confirmation(
+        &self,
+        mut receiver: UnboundedReceiver<ChannelMsg>,
+    ) -> Result<Channel<Msg>, Error> {
+        loop {
+            match receiver.recv().await {
+                Some(ChannelMsg::Open {
+                    id,
+                    max_packet_size,
+                    window_size,
+                }) => {
+                    return Ok(Channel {
+                        id,
+                        sender: self.sender.clone(),
+                        receiver,
+                        max_packet_size,
+                        window_size,
+                    });
+                }
+                None => {
+                    return Err(Error::Disconnect);
+                }
+                msg => {
+                    debug!("msg = {:?}", msg);
+                }
+            }
+        }
     }
 
     /// If the program was killed by a signal, send the details about the signal to the client.
@@ -103,7 +257,7 @@ impl Handle {
         lang_tag: String,
     ) -> Result<(), ()> {
         self.sender
-            .send((
+            .send(Msg::Channel(
                 id,
                 ChannelMsg::ExitSignal {
                     signal_name,
@@ -124,6 +278,169 @@ impl Session {
         } else {
             true
         }
+    }
+
+    pub(crate) async fn run<H, R>(
+        mut self,
+        mut stream: SshRead<R>,
+        mut handler: H,
+    ) -> Result<(), H::Error>
+    where
+        H: Handler + Send + 'static,
+        R: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        self.flush()?;
+        stream
+            .write_all(&self.common.write_buffer.buffer)
+            .await
+            .map_err(crate::Error::from)?;
+        self.common.write_buffer.buffer.clear();
+
+        let (stream_read, mut stream_write) = stream.split();
+        let buffer = SSHBuffer::new();
+
+        // Allow handing out references to the cipher
+        let mut opening_cipher = Box::new(clear::Key) as Box<dyn OpeningKey + Send>;
+        std::mem::swap(&mut opening_cipher, &mut self.common.cipher.remote_to_local);
+
+        let reading = start_reading(stream_read, buffer, opening_cipher);
+        pin!(reading);
+        let mut is_reading = None;
+        let mut decomp = CryptoVec::new();
+        let delay = self.common.config.connection_timeout;
+
+        #[allow(clippy::panic)] // false positive in macro
+        while !self.common.disconnected {
+            tokio::select! {
+                r = &mut reading => {
+                    let (stream_read, buffer, mut opening_cipher) = match r {
+                        Ok((_, stream_read, buffer, opening_cipher)) => (stream_read, buffer, opening_cipher),
+                        Err(e) => return Err(e.into())
+                    };
+                    if buffer.buffer.len() < 5 {
+                        is_reading = Some((stream_read, buffer, opening_cipher));
+                        break
+                    }
+                    #[allow(clippy::indexing_slicing)] // length checked
+                    let buf = if let Some(ref mut enc) = self.common.encrypted {
+                        let d = enc.decompress.decompress(
+                            &buffer.buffer[5..],
+                            &mut decomp,
+                        );
+                        if let Ok(buf) = d {
+                            buf
+                        } else {
+                            debug!("err = {:?}", d);
+                            is_reading = Some((stream_read, buffer, opening_cipher));
+                            break
+                        }
+                    } else {
+                        &buffer.buffer[5..]
+                    };
+                    if !buf.is_empty() {
+                        #[allow(clippy::indexing_slicing)] // length checked
+                        if buf[0] == crate::msg::DISCONNECT {
+                            debug!("break");
+                            is_reading = Some((stream_read, buffer, opening_cipher));
+                            break;
+                        } else if buf[0] > 4 {
+                            std::mem::swap(&mut opening_cipher, &mut self.common.cipher.remote_to_local);
+                            // TODO it'd be cleaner to just pass cipher to reply()
+                            match reply(self, handler, buf).await {
+                                Ok((h, s)) => {
+                                    handler = h;
+                                    self = s;
+                                },
+                                Err(e) => return Err(e),
+                            }
+                            std::mem::swap(&mut opening_cipher, &mut self.common.cipher.remote_to_local);
+                        }
+                    }
+                    reading.set(start_reading(stream_read, buffer, opening_cipher));
+                }
+                _ = timeout(delay) => {
+                    debug!("timeout");
+                    break
+                },
+                msg = self.receiver.recv(), if !self.is_rekeying() => {
+                    match msg {
+                        Some(Msg::Channel(id, ChannelMsg::Data { data })) => {
+                            self.data(id, data);
+                        }
+                        Some(Msg::Channel(id, ChannelMsg::ExtendedData { ext, data })) => {
+                            self.extended_data(id, ext, data);
+                        }
+                        Some(Msg::Channel(id, ChannelMsg::Eof)) => {
+                            self.eof(id);
+                        }
+                        Some(Msg::Channel(id, ChannelMsg::Close)) => {
+                            self.close(id);
+                        }
+                        Some(Msg::Channel(id, ChannelMsg::Success)) => {
+                            self.channel_success(id);
+                        }
+                        Some(Msg::Channel(id, ChannelMsg::XonXoff { client_can_do })) => {
+                            self.xon_xoff_request(id, client_can_do);
+                        }
+                        Some(Msg::Channel(id, ChannelMsg::ExitStatus { exit_status })) => {
+                            self.exit_status_request(id, exit_status);
+                        }
+                        Some(Msg::Channel(id, ChannelMsg::ExitSignal { signal_name, core_dumped, error_message, lang_tag })) => {
+                            self.exit_signal_request(id, signal_name, core_dumped, &error_message, &lang_tag);
+                        }
+                        Some(Msg::Channel(id, ChannelMsg::WindowAdjusted { new_size })) => {
+                            debug!("window adjusted to {:?} for channel {:?}", new_size, id);
+                        }
+                        Some(Msg::ChannelOpenSession { sender }) => {
+                            let id = self.channel_open_session()?;
+                            self.channels.insert(id, sender);
+                        }
+                        Some(Msg::ChannelOpenDirectTcpIp { host_to_connect, port_to_connect, originator_address, originator_port, sender }) => {
+                            let id = self.channel_open_direct_tcpip(&host_to_connect, port_to_connect, &originator_address, originator_port)?;
+                            self.channels.insert(id, sender);
+                        }
+                        Some(Msg::ChannelOpenForwardedTcpIp { host_to_connect, port_to_connect, originator_address, originator_port, sender }) => {
+                            let id = self.channel_open_forwarded_tcpip(&host_to_connect, port_to_connect, &originator_address, originator_port)?;
+                            self.channels.insert(id, sender);
+                        }
+                        Some(Msg::TcpIpForward { address, port }) => {
+                            self.tcpip_forward(false, &address, port);
+                        },
+                        Some(Msg::CancelTcpIpForward { address, port }) => {
+                            self.cancel_tcpip_forward(false, &address, port);
+                        },
+                        Some(_) => {
+                            debug!("unimplemented (intended for client?) message: {:?}", msg);
+                            self.unimplemented(0);
+                        }
+                        None => {
+                            debug!("self.receiver: received None");
+                        }
+                    }
+                }
+            }
+            self.flush()?;
+            stream_write
+                .write_all(&self.common.write_buffer.buffer)
+                .await
+                .map_err(crate::Error::from)?;
+            self.common.write_buffer.buffer.clear();
+        }
+        debug!("disconnected");
+        // Shutdown
+        stream_write.shutdown().await.map_err(crate::Error::from)?;
+        loop {
+            if let Some((stream_read, buffer, opening_cipher)) = is_reading.take() {
+                reading.set(start_reading(stream_read, buffer, opening_cipher));
+            }
+            let (n, r, b, opening_cipher) = (&mut reading).await?;
+            is_reading = Some((r, b, opening_cipher));
+            if n == 0 {
+                break;
+            }
+        }
+
+        Ok(())
     }
 
     /// Get a handle to this session.
@@ -394,6 +711,89 @@ impl Session {
         }
     }
 
+    /// Opens a new session channel on the client.
+    pub fn channel_open_session(&mut self) -> Result<ChannelId, Error> {
+        let result = if let Some(ref mut enc) = self.common.encrypted {
+            if !matches!(
+                enc.state,
+                EncryptedState::Authenticated | EncryptedState::InitCompression
+            ) {
+                return Err(Error::Inconsistent);
+            }
+
+            let sender_channel = enc.new_channel(
+                self.common.config.window_size,
+                self.common.config.maximum_packet_size,
+            );
+            push_packet!(enc.write, {
+                enc.write.push(msg::CHANNEL_OPEN);
+                enc.write.extend_ssh_string(b"session");
+
+                // sender channel id.
+                enc.write.push_u32_be(sender_channel.0);
+
+                // window.
+                enc.write
+                    .push_u32_be(self.common.config.as_ref().window_size);
+
+                // max packet size.
+                enc.write
+                    .push_u32_be(self.common.config.as_ref().maximum_packet_size);
+            });
+            sender_channel
+        } else {
+            return Err(Error::Inconsistent);
+        };
+        Ok(result)
+    }
+
+    /// Opens a direct TCP/IP channel on the client.
+    pub fn channel_open_direct_tcpip(
+        &mut self,
+        host_to_connect: &str,
+        port_to_connect: u32,
+        originator_address: &str,
+        originator_port: u32,
+    ) -> Result<ChannelId, Error> {
+        let result = if let Some(ref mut enc) = self.common.encrypted {
+            if !matches!(
+                enc.state,
+                EncryptedState::Authenticated | EncryptedState::InitCompression
+            ) {
+                return Err(Error::Inconsistent);
+            }
+
+            let sender_channel = enc.new_channel(
+                self.common.config.window_size,
+                self.common.config.maximum_packet_size,
+            );
+            push_packet!(enc.write, {
+                enc.write.push(msg::CHANNEL_OPEN);
+                enc.write.extend_ssh_string(b"direct-tcpip");
+
+                // sender channel id.
+                enc.write.push_u32_be(sender_channel.0);
+
+                // window.
+                enc.write
+                    .push_u32_be(self.common.config.as_ref().window_size);
+
+                // max packet size.
+                enc.write
+                    .push_u32_be(self.common.config.as_ref().maximum_packet_size);
+
+                enc.write.extend_ssh_string(host_to_connect.as_bytes());
+                enc.write.push_u32_be(port_to_connect); // sender channel id.
+                enc.write.extend_ssh_string(originator_address.as_bytes());
+                enc.write.push_u32_be(originator_port); // sender channel id.
+            });
+            sender_channel
+        } else {
+            return Err(Error::Inconsistent);
+        };
+        Ok(result)
+    }
+
     /// Open a TCP/IP forwarding channel, when a connection comes to a
     /// local port for which forwarding has been requested. See
     /// [RFC4254](https://tools.ietf.org/html/rfc4254#section-7). The
@@ -407,41 +807,75 @@ impl Session {
         originator_port: u32,
     ) -> Result<ChannelId, Error> {
         let result = if let Some(ref mut enc) = self.common.encrypted {
-            match enc.state {
-                EncryptedState::Authenticated => {
-                    debug!("sending open request");
-
-                    let sender_channel = enc.new_channel(
-                        self.common.config.window_size,
-                        self.common.config.maximum_packet_size,
-                    );
-                    push_packet!(enc.write, {
-                        enc.write.push(msg::CHANNEL_OPEN);
-                        enc.write.extend_ssh_string(b"forwarded-tcpip");
-
-                        // sender channel id.
-                        enc.write.push_u32_be(sender_channel.0);
-
-                        // window.
-                        enc.write
-                            .push_u32_be(self.common.config.as_ref().window_size);
-
-                        // max packet size.
-                        enc.write
-                            .push_u32_be(self.common.config.as_ref().maximum_packet_size);
-
-                        enc.write.extend_ssh_string(connected_address.as_bytes());
-                        enc.write.push_u32_be(connected_port); // sender channel id.
-                        enc.write.extend_ssh_string(originator_address.as_bytes());
-                        enc.write.push_u32_be(originator_port); // sender channel id.
-                    });
-                    sender_channel
-                }
-                _ => return Err(Error::Inconsistent),
+            if !matches!(
+                enc.state,
+                EncryptedState::Authenticated | EncryptedState::InitCompression
+            ) {
+                return Err(Error::Inconsistent);
             }
+            debug!("sending open request");
+
+            let sender_channel = enc.new_channel(
+                self.common.config.window_size,
+                self.common.config.maximum_packet_size,
+            );
+            push_packet!(enc.write, {
+                enc.write.push(msg::CHANNEL_OPEN);
+                enc.write.extend_ssh_string(b"forwarded-tcpip");
+
+                // sender channel id.
+                enc.write.push_u32_be(sender_channel.0);
+
+                // window.
+                enc.write
+                    .push_u32_be(self.common.config.as_ref().window_size);
+
+                // max packet size.
+                enc.write
+                    .push_u32_be(self.common.config.as_ref().maximum_packet_size);
+
+                enc.write.extend_ssh_string(connected_address.as_bytes());
+                enc.write.push_u32_be(connected_port); // sender channel id.
+                enc.write.extend_ssh_string(originator_address.as_bytes());
+                enc.write.push_u32_be(originator_port); // sender channel id.
+            });
+            sender_channel
         } else {
             return Err(Error::Inconsistent);
         };
         Ok(result)
+    }
+
+    pub fn tcpip_forward(&mut self, want_reply: bool, address: &str, port: u32) {
+        if let Some(ref mut enc) = self.common.encrypted {
+            push_packet!(enc.write, {
+                enc.write.push(msg::GLOBAL_REQUEST);
+                enc.write.extend_ssh_string(b"tcpip-forward");
+                enc.write.push(if want_reply { 1 } else { 0 });
+                enc.write.extend_ssh_string(address.as_bytes());
+                enc.write.push_u32_be(port);
+            });
+        }
+    }
+
+    pub fn cancel_tcpip_forward(&mut self, want_reply: bool, address: &str, port: u32) {
+        if let Some(ref mut enc) = self.common.encrypted {
+            push_packet!(enc.write, {
+                enc.write.push(msg::GLOBAL_REQUEST);
+                enc.write.extend_ssh_string(b"cancel-tcpip-forward");
+                enc.write.push(if want_reply { 1 } else { 0 });
+                enc.write.extend_ssh_string(address.as_bytes());
+                enc.write.push_u32_be(port);
+            });
+        }
+    }
+
+    fn unimplemented(&mut self, packet_id: u32) {
+        if let Some(ref mut enc) = self.common.encrypted {
+            push_packet!(enc.write, {
+                enc.write.push(msg::UNIMPLEMENTED);
+                enc.write.push_u32_be(packet_id);
+            });
+        }
     }
 }

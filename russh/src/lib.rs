@@ -320,8 +320,9 @@ macro_rules! push_packet {
     }};
 }
 
-mod session;
+pub mod channels;
 mod parsing;
+mod session;
 
 /// Server side of this library.
 pub mod server;
@@ -636,7 +637,7 @@ impl Display for ChannelId {
 
 /// The parameters of a channel.
 #[derive(Debug)]
-pub(crate) struct Channel {
+pub(crate) struct ChannelParams {
     recipient_channel: u32,
     sender_channel: ChannelId,
     recipient_window_size: u32,
@@ -647,35 +648,6 @@ pub(crate) struct Channel {
     pub confirmed: bool,
     wants_reply: bool,
     pending_data: std::collections::VecDeque<(CryptoVec, Option<u32>, usize)>,
-}
-
-#[derive(Debug)]
-pub enum ChannelMsg {
-    Data {
-        data: CryptoVec,
-    },
-    ExtendedData {
-        data: CryptoVec,
-        ext: u32,
-    },
-    Eof,
-    Close,
-    XonXoff {
-        client_can_do: bool,
-    },
-    ExitStatus {
-        exit_status: u32,
-    },
-    ExitSignal {
-        signal_name: Sig,
-        core_dumped: bool,
-        error_message: String,
-        lang_tag: String,
-    },
-    WindowAdjusted {
-        new_size: u32,
-    },
-    Success,
 }
 
 #[cfg(test)]
@@ -730,7 +702,7 @@ mod test_compress {
         channel.data(data).await.unwrap();
         let msg = channel.wait().await.unwrap();
         match msg {
-            ChannelMsg::Data { data: msg_data } => {
+            channels::ChannelMsg::Data { data: msg_data } => {
                 assert_eq!(*data, *msg_data)
             }
             msg => panic!("Unexpected message {:?}", msg),

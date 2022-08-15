@@ -31,24 +31,8 @@ impl OpenChannelMessage {
                     originator_port,
                 }
             }
-            b"direct-tcpip" => {
-                let host_to_connect =
-                    std::str::from_utf8(r.read_string().map_err(crate::Error::from)?)
-                        .map_err(crate::Error::from)?
-                        .to_owned();
-                let port_to_connect = r.read_u32().map_err(crate::Error::from)?;
-                let originator_address =
-                    std::str::from_utf8(r.read_string().map_err(crate::Error::from)?)
-                        .map_err(crate::Error::from)?
-                        .to_owned();
-                let originator_port = r.read_u32().map_err(crate::Error::from)?;
-                ChannelType::DirectTcpip {
-                    host_to_connect,
-                    port_to_connect,
-                    originator_address,
-                    originator_port,
-                }
-            }
+            b"direct-tcpip" => ChannelType::DirectTcpip(TcpChannelInfo::new(r)?),
+            b"forwarded-tcpip" => ChannelType::ForwardedTcpIp(TcpChannelInfo::new(r)?),
             t => ChannelType::Unknown { typ: t.to_vec() },
         };
 
@@ -96,13 +80,37 @@ pub enum ChannelType {
         originator_address: String,
         originator_port: u32,
     },
-    DirectTcpip {
-        host_to_connect: String,
-        port_to_connect: u32,
-        originator_address: String,
-        originator_port: u32,
-    },
+    DirectTcpip(TcpChannelInfo),
+    ForwardedTcpIp(TcpChannelInfo),
     Unknown {
         typ: Vec<u8>,
     },
+}
+
+#[derive(Debug)]
+pub struct TcpChannelInfo {
+    pub host_to_connect: String,
+    pub port_to_connect: u32,
+    pub originator_address: String,
+    pub originator_port: u32,
+}
+
+impl TcpChannelInfo {
+    fn new(r: &mut Position) -> Result<Self, crate::Error> {
+        let host_to_connect = std::str::from_utf8(r.read_string().map_err(crate::Error::from)?)
+            .map_err(crate::Error::from)?
+            .to_owned();
+        let port_to_connect = r.read_u32().map_err(crate::Error::from)?;
+        let originator_address = std::str::from_utf8(r.read_string().map_err(crate::Error::from)?)
+            .map_err(crate::Error::from)?
+            .to_owned();
+        let originator_port = r.read_u32().map_err(crate::Error::from)?;
+
+        Ok(Self {
+            host_to_connect,
+            port_to_connect,
+            originator_address,
+            originator_port,
+        })
+    }
 }
