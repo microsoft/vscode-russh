@@ -68,7 +68,7 @@ pub struct Handle {
 
 impl Handle {
     /// Send data to the session referenced by this handler.
-    pub async fn data(&mut self, id: ChannelId, data: CryptoVec) -> Result<(), CryptoVec> {
+    pub async fn data(&self, id: ChannelId, data: CryptoVec) -> Result<(), CryptoVec> {
         self.sender
             .send(Msg::Channel(id, ChannelMsg::Data { data }))
             .await
@@ -80,7 +80,7 @@ impl Handle {
 
     /// Send data to the session referenced by this handler.
     pub async fn extended_data(
-        &mut self,
+        &self,
         id: ChannelId,
         ext: u32,
         data: CryptoVec,
@@ -95,7 +95,7 @@ impl Handle {
     }
 
     /// Send EOF to the session referenced by this handler.
-    pub async fn eof(&mut self, id: ChannelId) -> Result<(), ()> {
+    pub async fn eof(&self, id: ChannelId) -> Result<(), ()> {
         self.sender
             .send(Msg::Channel(id, ChannelMsg::Eof))
             .await
@@ -103,7 +103,7 @@ impl Handle {
     }
 
     /// Send success to the session referenced by this handler.
-    pub async fn channel_success(&mut self, id: ChannelId) -> Result<(), ()> {
+    pub async fn channel_success(&self, id: ChannelId) -> Result<(), ()> {
         self.sender
             .send(Msg::Channel(id, ChannelMsg::Success))
             .await
@@ -111,7 +111,7 @@ impl Handle {
     }
 
     /// Close a channel.
-    pub async fn close(&mut self, id: ChannelId) -> Result<(), ()> {
+    pub async fn close(&self, id: ChannelId) -> Result<(), ()> {
         self.sender
             .send(Msg::Channel(id, ChannelMsg::Close))
             .await
@@ -121,7 +121,7 @@ impl Handle {
     /// Inform the client of whether they may perform
     /// control-S/control-Q flow control. See
     /// [RFC4254](https://tools.ietf.org/html/rfc4254#section-6.8).
-    pub async fn xon_xoff_request(&mut self, id: ChannelId, client_can_do: bool) -> Result<(), ()> {
+    pub async fn xon_xoff_request(&self, id: ChannelId, client_can_do: bool) -> Result<(), ()> {
         self.sender
             .send(Msg::Channel(id, ChannelMsg::XonXoff { client_can_do }))
             .await
@@ -129,7 +129,7 @@ impl Handle {
     }
 
     /// Send the exit status of a program.
-    pub async fn exit_status_request(&mut self, id: ChannelId, exit_status: u32) -> Result<(), ()> {
+    pub async fn exit_status_request(&self, id: ChannelId, exit_status: u32) -> Result<(), ()> {
         self.sender
             .send(Msg::Channel(id, ChannelMsg::ExitStatus { exit_status }))
             .await
@@ -137,7 +137,7 @@ impl Handle {
     }
 
     /// Notifies the client that it can open TCP/IP forwarding channels for a port.
-    pub async fn forward_tcpip(&mut self, address: String, port: u32) -> Result<(), ()> {
+    pub async fn forward_tcpip(&self, address: String, port: u32) -> Result<(), ()> {
         self.sender
             .send(Msg::TcpIpForward { address, port })
             .await
@@ -145,7 +145,7 @@ impl Handle {
     }
 
     /// Notifies the client that it can no longer open TCP/IP forwarding channel for a port.
-    pub async fn cancel_forward_tcpip(&mut self, address: String, port: u32) -> Result<(), ()> {
+    pub async fn cancel_forward_tcpip(&self, address: String, port: u32) -> Result<(), ()> {
         self.sender
             .send(Msg::CancelTcpIpForward { address, port })
             .await
@@ -157,7 +157,7 @@ impl Handle {
     /// connection is authenticated, but the channel only becomes
     /// usable when it's confirmed by the server, as indicated by the
     /// `confirmed` field of the corresponding `Channel`.
-    pub async fn channel_open_session(&mut self) -> Result<Channel<Msg>, Error> {
+    pub async fn channel_open_session(&self) -> Result<Channel<Msg>, Error> {
         let (sender, receiver) = unbounded_channel();
         self.sender
             .send(Msg::ChannelOpenSession { sender })
@@ -172,7 +172,7 @@ impl Handle {
     /// TCP/IP packets can then be tunneled through the channel using
     /// `.data()`.
     pub async fn channel_open_direct_tcpip<A: Into<String>, B: Into<String>>(
-        &mut self,
+        &self,
         host_to_connect: A,
         port_to_connect: u32,
         originator_address: B,
@@ -198,7 +198,7 @@ impl Handle {
     /// TCP/IP packets can then be tunneled through the channel using
     /// `.data()`.
     pub async fn channel_open_forwarded_tcpip<A: Into<String>, B: Into<String>>(
-        &mut self,
+        &self,
         host_to_connect: A,
         port_to_connect: u32,
         originator_address: B,
@@ -249,7 +249,7 @@ impl Handle {
 
     /// If the program was killed by a signal, send the details about the signal to the client.
     pub async fn exit_signal_request(
-        &mut self,
+        &self,
         id: ChannelId,
         signal_name: Sig,
         core_dumped: bool,
