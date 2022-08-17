@@ -283,6 +283,7 @@
 extern crate bitflags;
 #[macro_use]
 extern crate log;
+#[cfg(feature = "libsodium")]
 extern crate russh_libsodium as sodium;
 #[macro_use]
 extern crate thiserror;
@@ -778,4 +779,17 @@ mod test_compress {
             self.finished_bool(true)
         }
     }
+}
+
+#[cfg(not(feature = "libsodium"))]
+pub(crate) fn randombytes(fill: &mut [u8]) {
+    // prefer to use libsodium, but if not available, thread_rng is a CSRNG
+    use rand::RngCore;
+    rand::thread_rng().fill_bytes(fill);
+}
+
+#[cfg(feature = "libsodium")]
+pub(crate) fn randombytes(fill: &mut [u8]) {
+    use sodium::random::randombytes;
+    randombytes(fill);
 }

@@ -15,7 +15,6 @@ use std::marker::PhantomData;
 
 use aes::cipher::{IvSizeUser, KeyIvInit, KeySizeUser, StreamCipher};
 use generic_array::GenericArray;
-use russh_libsodium::random::randombytes;
 
 use super::super::Error;
 use super::PACKET_LENGTH_LEN;
@@ -158,7 +157,7 @@ impl<C: StreamCipher + KeySizeUser + IvSizeUser> super::SealingKey for SealingKe
     }
 
     fn fill_padding(&self, padding_out: &mut [u8]) {
-        randombytes(padding_out);
+        crate::randombytes(padding_out);
     }
 
     fn tag_len(&self) -> usize {

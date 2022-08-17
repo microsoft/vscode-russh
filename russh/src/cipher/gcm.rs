@@ -19,7 +19,6 @@ use aes_gcm::{AeadCore, AeadInPlace, Aes256Gcm, KeyInit, KeySizeUser};
 use byteorder::{BigEndian, ByteOrder};
 use digest::typenum::Unsigned;
 use generic_array::GenericArray;
-use sodium::random::randombytes;
 
 use super::super::Error;
 use crate::mac::MacAlgorithm;
@@ -178,7 +177,7 @@ impl super::SealingKey for SealingKey {
     }
 
     fn fill_padding(&self, padding_out: &mut [u8]) {
-        randombytes(padding_out);
+        crate::randombytes(padding_out);
     }
 
     fn tag_len(&self) -> usize {

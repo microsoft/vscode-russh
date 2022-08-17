@@ -52,6 +52,7 @@ pub struct Preferred {
 }
 
 const KEX_ORDER: &[kex::Name] = &[
+    #[cfg(feature = "libsodium")]
     kex::CURVE25519,
     kex::DH_G14_SHA256,
     kex::DH_G14_SHA1,
@@ -59,6 +60,7 @@ const KEX_ORDER: &[kex::Name] = &[
 ];
 
 const CIPHER_ORDER: &[cipher::Name] = &[
+    #[cfg(feature = "libsodium")]
     cipher::CHACHA20_POLY1305,
     cipher::AES_256_GCM,
     cipher::AES_256_CTR,
@@ -76,20 +78,19 @@ const HMAC_ORDER: &[mac::Name] = &[
     mac::NONE,
 ];
 
-impl Preferred {
+const KEY_ORDER: &[key::Name] = &[
+    #[cfg(feature = "libsodium")]
+    key::ED25519,
     #[cfg(feature = "openssl")]
-    pub const DEFAULT: Preferred = Preferred {
-        kex: KEX_ORDER,
-        key: &[key::ED25519, key::RSA_SHA2_256, key::RSA_SHA2_512],
-        cipher: CIPHER_ORDER,
-        mac: HMAC_ORDER,
-        compression: &["none", "zlib", "zlib@openssh.com"],
-    };
+    key::RSA_SHA2_256,
+    #[cfg(feature = "openssl")]
+    key::RSA_SHA2_256,
+];
 
-    #[cfg(not(feature = "openssl"))]
+impl Preferred {
     pub const DEFAULT: Preferred = Preferred {
         kex: KEX_ORDER,
-        key: &[key::ED25519],
+        key: KEY_ORDER,
         cipher: CIPHER_ORDER,
         mac: HMAC_ORDER,
         compression: &["none", "zlib", "zlib@openssh.com"],
@@ -97,7 +98,7 @@ impl Preferred {
 
     pub const COMPRESSED: Preferred = Preferred {
         kex: KEX_ORDER,
-        key: &[key::ED25519, key::RSA_SHA2_256, key::RSA_SHA2_512],
+        key: KEY_ORDER,
         cipher: CIPHER_ORDER,
         mac: HMAC_ORDER,
         compression: &["zlib", "zlib@openssh.com", "none"],
