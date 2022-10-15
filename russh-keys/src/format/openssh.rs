@@ -111,6 +111,7 @@ fn decrypt_secret_key(
             _ => return Err(Error::CouldNotReadKey),
         };
         match kdfname {
+            #[cfg(feature = "rs-crypto")]
             b"bcrypt" => {
                 let mut kdfopts = kdfoptions.reader(0);
                 let salt = kdfopts.read_string()?;
