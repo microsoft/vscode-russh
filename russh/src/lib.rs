@@ -27,198 +27,14 @@
 //! `client::Handler` for clients and `server::Handler` for
 //! servers.
 //!
-//! # Writing servers
+//! * [Writing SSH clients - the `russh::client` module](client)
+//! * [Writing SSH servers - the `russh::server` module](server)
 //!
-//! In the specific case of servers, a server must implement
-//! `server::Server`, a trait for creating new `server::Handler`. The
-//! main type to look at in the `server` module is `Session` (and
-//! `Config`, of course).
+//! # Important crate features
 //!
-//! Here is an example server, which forwards input from each client
-//! to all other clients:
+//! * RSA key support is gated behind the `openssl` feature (disabled by default).
+//! * Enabling that and disabling the `rs-crypto` feature (enabled by default) will leave you with a very basic, but pure-OpenSSL RSA+AES cipherset.
 //!
-//! ```
-//! extern crate russh;
-//! extern crate russh_keys;
-//! extern crate futures;
-//! extern crate tokio;
-//! use std::sync::{Mutex, Arc};
-//! use std::str::FromStr;
-//! use russh::*;
-//! use russh::server::{Auth, Session};
-//! use russh_keys::*;
-//! use std::collections::HashMap;
-//! use futures::Future;
-//!
-//! #[tokio::main]
-//! async fn main() {
-//!     let client_key = russh_keys::key::KeyPair::generate_ed25519().unwrap();
-//!     let client_pubkey = Arc::new(client_key.clone_public_key().unwrap());
-//!     let mut config = russh::server::Config::default();
-//!     config.connection_timeout = Some(std::time::Duration::from_secs(3));
-//!     config.auth_rejection_time = std::time::Duration::from_secs(3);
-//!     config.keys.push(russh_keys::key::KeyPair::generate_ed25519().unwrap());
-//!     let config = Arc::new(config);
-//!     let sh = Server{
-//!         client_pubkey,
-//!         clients: Arc::new(Mutex::new(HashMap::new())),
-//!         id: 0
-//!     };
-//!     tokio::time::timeout(
-//!        std::time::Duration::from_secs(1),
-//!        russh::server::run(config, &std::net::SocketAddr::from_str("0.0.0.0:2222").unwrap(), sh)
-//!     ).await.unwrap_or(Ok(()));
-//! }
-//!
-//! #[derive(Clone)]
-//! struct Server {
-//!     client_pubkey: Arc<russh_keys::key::PublicKey>,
-//!     clients: Arc<Mutex<HashMap<(usize, ChannelId), russh::server::Handle>>>,
-//!     id: usize,
-//! }
-//!
-//! impl server::Server for Server {
-//!     type Handler = Self;
-//!     fn new_client(&mut self, _: Option<std::net::SocketAddr>) -> Self {
-//!         let s = self.clone();
-//!         self.id += 1;
-//!         s
-//!     }
-//! }
-//!
-//! impl server::Handler for Server {
-//!     type Error = anyhow::Error;
-//!     type FutureAuth = futures::future::Ready<Result<(Self, server::Auth), anyhow::Error>>;
-//!     type FutureUnit = futures::future::Ready<Result<(Self, Session), anyhow::Error>>;
-//!     type FutureBool = futures::future::Ready<Result<(Self, Session, bool), anyhow::Error>>;
-//!
-//!     fn finished_auth(mut self, auth: Auth) -> Self::FutureAuth {
-//!         futures::future::ready(Ok((self, auth)))
-//!     }
-//!     fn finished_bool(self, b: bool, s: Session) -> Self::FutureBool {
-//!         futures::future::ready(Ok((self, s, b)))
-//!     }
-//!     fn finished(self, s: Session) -> Self::FutureUnit {
-//!         futures::future::ready(Ok((self, s)))
-//!     }
-//!     fn channel_open_session(self, channel: ChannelId, session: Session) -> Self::FutureBool {
-//!         {
-//!             let mut clients = self.clients.lock().unwrap();
-//!             clients.insert((self.id, channel), session.handle());
-//!         }
-//!         self.finished_bool(true, session)
-//!     }
-//!     fn auth_publickey(self, _: &str, _: &key::PublicKey) -> Self::FutureAuth {
-//!         self.finished_auth(server::Auth::Accept)
-//!     }
-//!     fn data(self, channel: ChannelId, data: &[u8], mut session: Session) -> Self::FutureUnit {
-//!         {
-//!             let mut clients = self.clients.lock().unwrap();
-//!             for ((id, channel), ref mut s) in clients.iter_mut() {
-//!                 if *id != self.id {
-//!                     s.data(*channel, CryptoVec::from_slice(data));
-//!                 }
-//!             }
-//!         }
-//!         session.data(channel, CryptoVec::from_slice(data));
-//!         self.finished(session)
-//!     }
-//! }
-//! ```
-//!
-//! Note the call to `session.handle()`, which allows to keep a handle
-//! to a client outside the event loop. This feature is internally
-//! implemented using `futures::sync::mpsc` channels.
-//!
-//! Note that this is just a toy server. In particular:
-//!
-//! - It doesn't handle errors when `s.data` returns an error, i.e. when the
-//!   client has disappeared
-//!
-//! - Each new connection increments the `id` field. Even though we
-//! would need a lot of connections per second for a very long time to
-//! saturate it, there are probably better ways to handle this to
-//! avoid collisions.
-//!
-//!
-//! # Implementing clients
-//!
-//! Maybe surprisingly, the data types used by Russh to implement
-//! clients are relatively more complicated than for servers. This is
-//! mostly related to the fact that clients are generally used both in
-//! a synchronous way (in the case of SSH, we can think of sending a
-//! shell command), and asynchronously (because the server may send
-//! unsollicited messages), and hence need to handle multiple
-//! interfaces.
-//!
-//! The important types in the `client` module are `Session` and
-//! `Connection`. A `Connection` is typically used to send commands to
-//! the server and wait for responses, and contains a `Session`. The
-//! `Session` is passed to the `Handler` when the client receives
-//! data.
-//!
-//! ```
-//! extern crate russh;
-//! extern crate russh_keys;
-//! extern crate futures;
-//! extern crate tokio;
-//! extern crate env_logger;
-//! use std::sync::Arc;
-//! use russh::*;
-//! use russh::server::{Auth, Session};
-//! use russh_keys::*;
-//! use futures::Future;
-//! use std::io::Read;
-//! use std::net::SocketAddr;
-//! use std::str::FromStr;
-//!
-//! struct Client {
-//! }
-//!
-//! impl client::Handler for Client {
-//!    type Error = anyhow::Error;
-//!    type FutureUnit = futures::future::Ready<Result<(Self, client::Session), anyhow::Error>>;
-//!    type FutureBool = futures::future::Ready<Result<(Self, bool), anyhow::Error>>;
-//!
-//!    fn finished_bool(self, b: bool) -> Self::FutureBool {
-//!        futures::future::ready(Ok((self, b)))
-//!    }
-//!    fn finished(self, session: client::Session) -> Self::FutureUnit {
-//!        futures::future::ready(Ok((self, session)))
-//!    }
-//!    fn check_server_key(self, server_public_key: &key::PublicKey) -> Self::FutureBool {
-//!        println!("check_server_key: {:?}", server_public_key);
-//!        self.finished_bool(true)
-//!    }
-//!    fn channel_open_confirmation(self, channel: ChannelId, max_packet_size: u32, window_size: u32, session: client::Session) -> Self::FutureUnit {
-//!        println!("channel_open_confirmation: {:?}", channel);
-//!        self.finished(session)
-//!    }
-//!    fn data(self, channel: ChannelId, data: &[u8], session: client::Session) -> Self::FutureUnit {
-//!        println!("data on channel {:?}: {:?}", channel, std::str::from_utf8(data));
-//!        self.finished(session)
-//!    }
-//! }
-//!
-//! #[tokio::main]
-//! async fn main() {
-//!   let config = russh::client::Config::default();
-//!   let config = Arc::new(config);
-//!   let sh = Client{};
-//!
-//!   let key = russh_keys::key::KeyPair::generate_ed25519().unwrap();
-//!   let mut agent = russh_keys::agent::client::AgentClient::connect_env().await.unwrap();
-//!   agent.add_identity(&key, &[]).await.unwrap();
-//!   let mut session = russh::client::connect(config, SocketAddr::from_str("127.0.0.1:22").unwrap(), sh).await.unwrap();
-//!   if session.authenticate_future(std::env::var("USER").unwrap(), key.clone_public_key().unwrap(), agent).await.1.unwrap() {
-//!     let mut channel = session.channel_open_session().await.unwrap();
-//!     channel.data(&b"Hello, world!"[..]).await.unwrap();
-//!     if let Some(msg) = channel.wait().await {
-//!         println!("{:?}", msg)
-//!     }
-//!   }
-//! }
-//! ```
 //! # Using non-socket IO / writing tunnels
 //!
 //! The easy way to implement SSH tunnels, like `ProxyCommand` for
@@ -277,30 +93,30 @@
 //! starts again. In the special case of the server, unsollicited
 //! messages sent through a `server::Handle` are processed when there
 //! is no incoming packet to read.
-#[macro_use]
-extern crate bitflags;
-#[macro_use]
-extern crate log;
-#[macro_use]
-extern crate thiserror;
 
-use std::fmt::{Display, Formatter};
+use std::fmt::{Debug, Display, Formatter};
 
 use parsing::ChannelOpenConfirmation;
 pub use russh_cryptovec::CryptoVec;
+use thiserror::Error;
 
 mod auth;
+
+/// Cipher names
 pub mod cipher;
-mod compression;
+/// Key exchange algorithm names
 pub mod kex;
-mod key;
+/// MAC algorithm names
 pub mod mac;
+
+mod compression;
+mod key;
 mod msg;
 mod negotiation;
 mod ssh_read;
 mod sshbuffer;
 
-pub use negotiation::{Named, Preferred};
+pub use negotiation::Preferred;
 
 mod pty;
 
@@ -324,6 +140,10 @@ macro_rules! push_packet {
 
 mod channels;
 pub use channels::{Channel, ChannelMsg};
+
+mod channel_stream;
+pub use channel_stream::ChannelStream;
+
 mod parsing;
 mod session;
 
@@ -402,6 +222,10 @@ pub enum Error {
     /// Message received/sent on unopened channel.
     #[error("Channel not open")]
     WrongChannel,
+
+    /// Server refused to open a channel.
+    #[error("Failed to open channel ({0:?})")]
+    ChannelOpenFailure(ChannelOpenFailure),
 
     /// Disconnected
     #[error("Disconnected")]
@@ -650,8 +474,12 @@ mod test_compress {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
-    use super::server::{Auth, Server as _, Session};
+    use async_trait::async_trait;
+    use log::debug;
+
+    use super::server::{Server as _, Session};
     use super::*;
+    use crate::server::Msg;
 
     #[cfg(feature = "rs-crypto")]
     fn geneate_keypair() -> russh_keys::key::KeyPair {
@@ -698,7 +526,10 @@ mod test_compress {
         dbg!(&addr);
         let mut session = client::connect(config, addr, Client {}).await.unwrap();
         let authenticated = session
-            .authenticate_publickey(std::env::var("USER").unwrap(), Arc::new(client_key))
+            .authenticate_publickey(
+                std::env::var("USER").unwrap_or("user".to_owned()),
+                Arc::new(client_key),
+            )
             .await
             .unwrap();
         assert!(authenticated);
@@ -730,208 +561,408 @@ mod test_compress {
         }
     }
 
+    #[async_trait]
     impl server::Handler for Server {
         type Error = super::Error;
-        type FutureAuth = futures::future::Ready<Result<(Self, server::Auth), Self::Error>>;
-        type FutureUnit = futures::future::Ready<Result<(Self, Session), Self::Error>>;
-        type FutureBool = futures::future::Ready<Result<(Self, Session, bool), Self::Error>>;
 
-        fn finished_auth(self, auth: Auth) -> Self::FutureAuth {
-            futures::future::ready(Ok((self, auth)))
-        }
-        fn finished_bool(self, b: bool, s: Session) -> Self::FutureBool {
-            futures::future::ready(Ok((self, s, b)))
-        }
-        fn finished(self, s: Session) -> Self::FutureUnit {
-            futures::future::ready(Ok((self, s)))
-        }
-        fn channel_open_session(self, channel: ChannelId, session: Session) -> Self::FutureBool {
+        async fn channel_open_session(
+            self,
+            channel: Channel<Msg>,
+            session: Session,
+        ) -> Result<(Self, bool, Session), Self::Error> {
             {
                 let mut clients = self.clients.lock().unwrap();
-                clients.insert((self.id, channel), session.handle());
+                clients.insert((self.id, channel.id()), session.handle());
             }
-            self.finished_bool(true, session)
+            Ok((self, true, session))
         }
-        fn auth_publickey(self, _: &str, _: &russh_keys::key::PublicKey) -> Self::FutureAuth {
+        async fn auth_publickey(
+            self,
+            _: &str,
+            _: &russh_keys::key::PublicKey,
+        ) -> Result<(Self, server::Auth), Self::Error> {
             debug!("auth_publickey");
-            self.finished_auth(server::Auth::Accept)
+            Ok((self, server::Auth::Accept))
         }
-        fn data(self, channel: ChannelId, data: &[u8], mut session: Session) -> Self::FutureUnit {
+        async fn data(
+            self,
+            channel: ChannelId,
+            data: &[u8],
+            mut session: Session,
+        ) -> Result<(Self, Session), Self::Error> {
             debug!("server data = {:?}", std::str::from_utf8(data));
             session.data(channel, CryptoVec::from_slice(data));
-            self.finished(session)
+            Ok((self, session))
         }
     }
 
     struct Client {}
 
+    #[async_trait]
     impl client::Handler for Client {
         type Error = super::Error;
-        type FutureUnit = futures::future::Ready<Result<(Self, client::Session), Self::Error>>;
-        type FutureBool = futures::future::Ready<Result<(Self, bool), Self::Error>>;
 
-        fn finished_bool(self, b: bool) -> Self::FutureBool {
-            futures::future::ready(Ok((self, b)))
-        }
-        fn finished(self, session: client::Session) -> Self::FutureUnit {
-            futures::future::ready(Ok((self, session)))
-        }
-        fn check_server_key(
+        async fn check_server_key(
             self,
             _server_public_key: &russh_keys::key::PublicKey,
-        ) -> Self::FutureBool {
+        ) -> Result<(Self, bool), Self::Error> {
             // println!("check_server_key: {:?}", server_public_key);
-            self.finished_bool(true)
+            Ok((self, true))
         }
     }
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::panic)]
-mod test_server_channels {
+use futures::Future;
+
+#[cfg(test)]
+async fn test_session<RC, RS, CH, SH, F1, F2, CERR, SERR>(
+    client_handler: CH,
+    server_handler: SH,
+    run_client: RC,
+    run_server: RS,
+) where
+    RC: FnOnce(crate::client::Handle<CH>) -> F1 + Send + Sync + 'static,
+    RS: FnOnce(crate::server::Handle) -> F2 + Send + Sync + 'static,
+    F1: Future<Output = crate::client::Handle<CH>> + Send + Sync + 'static,
+    F2: Future<Output = crate::server::Handle> + Send + Sync + 'static,
+    CERR: std::fmt::Debug + Send,
+    SERR: std::fmt::Debug + Send,
+    CH: crate::client::Handler<Error = CERR> + Send + Sync + 'static,
+    SH: crate::server::Handler<Error = SERR> + Send + Sync + 'static,
+{
     use std::sync::Arc;
 
-    use super::server::{Auth, Server as _, Session};
-    use super::*;
+
+    use crate::*;
 
     #[cfg(feature = "rs-crypto")]
-    fn geneate_keypair() -> russh_keys::key::KeyPair {
+    fn generate_keypair() -> russh_keys::key::KeyPair {
         russh_keys::key::KeyPair::generate_ed25519().unwrap()
     }
 
-    #[cfg(all(feature = "openssl", not(feature = "rs-crypto")))]
-    fn geneate_keypair() -> russh_keys::key::KeyPair {
+    #[cfg(not(feature = "rs-crypto"))]
+    fn generate_keypair() -> russh_keys::key::KeyPair {
         russh_keys::key::KeyPair::generate_rsa(2048, russh_keys::key::SignatureHash::SHA2_256)
             .unwrap()
     }
 
-    #[tokio::test]
-    async fn test_server_channels() {
-        let _ = env_logger::try_init();
-
-        let client_key = geneate_keypair();
-        let config = server::Config {
-            connection_timeout: None,
-            auth_rejection_time: std::time::Duration::from_secs(3),
-            keys: vec![geneate_keypair()],
-            ..Default::default()
-        };
-
-        let config = Arc::new(config);
-        let mut sh = Server {};
-        let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = socket.local_addr().unwrap();
-
-        let join = tokio::spawn(async move {
-            let (socket, _) = socket.accept().await.unwrap();
-            let mut server = sh.new_client(socket.peer_addr().ok());
-            let auth_waiter = server.get_auth_waiter();
-            let session = server::run_stream(config, socket, server).await.unwrap();
-
-            auth_waiter.await.unwrap();
-
-            let mut ch = session.handle().channel_open_session().await.unwrap();
-            ch.data(&b"hello world!"[..]).await.unwrap();
-
-            let msg = ch.wait().await.unwrap();
-            if let ChannelMsg::Data { data } = msg {
-                assert_eq!(data.as_ref(), &b"hey there!"[..]);
-            } else {
-                panic!("Unexpected message {:?}", msg);
-            }
-        });
-
-        let config = Arc::new(client::Config::default());
-        let mut session = client::connect(config, addr, Client {}).await.unwrap();
-        let authenticated = session
-            .authenticate_publickey(std::env::var("USER").unwrap(), Arc::new(client_key))
-            .await
-            .unwrap();
-
-        assert!(authenticated);
-
-        join.await.unwrap();
-
-        drop(session);
-    }
+    let _ = env_logger::try_init();
+    let client_key = generate_keypair();
+    let mut config = server::Config::default();
+    config.connection_timeout = None;
+    config.auth_rejection_time = std::time::Duration::from_secs(3);
+    config.keys.push(generate_keypair());
+    let config = Arc::new(config);
+    let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = socket.local_addr().unwrap();
 
     #[derive(Clone)]
     struct Server {}
 
-    impl server::Server for Server {
-        type Handler = ServerHandle;
-        fn new_client(&mut self, _: Option<std::net::SocketAddr>) -> ServerHandle {
-            ServerHandle { did_auth: None }
-        }
-    }
+    let server_join = tokio::spawn(async move {
+        let (socket, _) = socket.accept().await.unwrap();
 
-    struct ServerHandle {
-        did_auth: Option<tokio::sync::oneshot::Sender<()>>,
-    }
+        server::run_stream(config, socket, server_handler)
+            .await
+            .map_err(|_| ())
+            .unwrap()
+    });
 
-    impl ServerHandle {
-        fn get_auth_waiter(&mut self) -> tokio::sync::oneshot::Receiver<()> {
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            self.did_auth = Some(tx);
-            rx
-        }
-    }
+    let client_join = tokio::spawn(async move {
+        let config = Arc::new(client::Config::default());
+        let mut session = client::connect(config, addr, client_handler)
+            .await
+            .unwrap();
+        let authenticated = session
+            .authenticate_publickey(
+                std::env::var("USER").unwrap_or("user".to_owned()),
+                Arc::new(client_key),
+            )
+            .await
+            .unwrap();
+        assert!(authenticated);
+        session
+    });
 
-    impl server::Handler for ServerHandle {
-        type Error = super::Error;
-        type FutureAuth = futures::future::Ready<Result<(Self, server::Auth), Self::Error>>;
-        type FutureUnit = futures::future::Ready<Result<(Self, Session), Self::Error>>;
-        type FutureBool = futures::future::Ready<Result<(Self, Session, bool), Self::Error>>;
+    let (server_session, client_session) = tokio::join!(server_join, client_join);
+    let client_handle = tokio::spawn(run_client(client_session.unwrap()));
+    let server_handle = tokio::spawn(run_server(server_session.unwrap().handle()));
 
-        fn finished_auth(self, auth: Auth) -> Self::FutureAuth {
-            futures::future::ready(Ok((self, auth)))
-        }
-        fn finished_bool(self, b: bool, s: Session) -> Self::FutureBool {
-            futures::future::ready(Ok((self, s, b)))
-        }
-        fn finished(self, s: Session) -> Self::FutureUnit {
-            futures::future::ready(Ok((self, s)))
-        }
-        fn auth_publickey(self, _: &str, _: &russh_keys::key::PublicKey) -> Self::FutureAuth {
-            self.finished_auth(server::Auth::Accept)
-        }
-        fn auth_succeeded(mut self, session: Session) -> Self::FutureUnit {
-            if let Some(a) = self.did_auth.take() {
-                a.send(()).unwrap();
+    let (server_session, client_session) = tokio::join!(server_handle, client_handle);
+    drop(client_session);
+    drop(server_session);
+}
+
+#[cfg(test)]
+mod test_channels {
+    use async_trait::async_trait;
+    use russh_cryptovec::CryptoVec;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use crate::server::Session;
+    use crate::{client, server, test_session, Channel, ChannelId, ChannelMsg};
+
+    #[tokio::test]
+    async fn test_server_channels() {
+        #[derive(Debug)]
+        struct Client {}
+
+        #[async_trait]
+        impl client::Handler for Client {
+            type Error = crate::Error;
+
+            async fn check_server_key(
+                self,
+                _server_public_key: &russh_keys::key::PublicKey,
+            ) -> Result<(Self, bool), Self::Error> {
+                Ok((self, true))
             }
-            self.finished(session)
+
+            async fn data(
+                self,
+                channel: ChannelId,
+                data: &[u8],
+                mut session: client::Session,
+            ) -> Result<(Self, client::Session), Self::Error> {
+                assert_eq!(data, &b"hello world!"[..]);
+                session.data(channel, CryptoVec::from_slice(&b"hey there!"[..]));
+                Ok((self, session))
+            }
         }
+
+        struct ServerHandle {
+            did_auth: Option<tokio::sync::oneshot::Sender<()>>,
+        }
+
+        impl ServerHandle {
+            fn get_auth_waiter(&mut self) -> tokio::sync::oneshot::Receiver<()> {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                self.did_auth = Some(tx);
+                rx
+            }
+        }
+
+        #[async_trait]
+        impl server::Handler for ServerHandle {
+            type Error = crate::Error;
+
+            async fn auth_publickey(
+                self,
+                _: &str,
+                _: &russh_keys::key::PublicKey,
+            ) -> Result<(Self, server::Auth), Self::Error> {
+                Ok((self, server::Auth::Accept))
+            }
+            async fn auth_succeeded(
+                mut self,
+                session: Session,
+            ) -> Result<(Self, Session), Self::Error> {
+                if let Some(a) = self.did_auth.take() {
+                    a.send(()).unwrap();
+                }
+                Ok((self, session))
+            }
+        }
+
+        let mut sh = ServerHandle { did_auth: None };
+        let a = sh.get_auth_waiter();
+        test_session(
+            Client {},
+            sh,
+            |c| async move { c },
+            |s| async move {
+                a.await.unwrap();
+                let mut ch = s.channel_open_session().await.unwrap();
+                ch.data(&b"hello world!"[..]).await.unwrap();
+
+                let msg = ch.wait().await.unwrap();
+                if let ChannelMsg::Data { data } = msg {
+                    assert_eq!(data.as_ref(), &b"hey there!"[..]);
+                } else {
+                    panic!("Unexpected message {:?}", msg);
+                }
+                s
+            },
+        )
+        .await;
     }
 
-    struct Client {}
+    #[tokio::test]
+    async fn test_channel_streams() {
+        #[derive(Debug)]
+        struct Client {}
 
-    impl client::Handler for Client {
-        type Error = super::Error;
-        type FutureUnit = futures::future::Ready<Result<(Self, client::Session), Self::Error>>;
-        type FutureBool = futures::future::Ready<Result<(Self, bool), Self::Error>>;
+        #[async_trait]
+        impl client::Handler for Client {
+            type Error = crate::Error;
 
-        fn finished_bool(self, b: bool) -> Self::FutureBool {
-            futures::future::ready(Ok((self, b)))
-        }
-        fn finished(self, session: client::Session) -> Self::FutureUnit {
-            futures::future::ready(Ok((self, session)))
-        }
-        fn check_server_key(
-            self,
-            _server_public_key: &russh_keys::key::PublicKey,
-        ) -> Self::FutureBool {
-            self.finished_bool(true)
+            async fn check_server_key(
+                self,
+                _server_public_key: &russh_keys::key::PublicKey,
+            ) -> Result<(Self, bool), Self::Error> {
+                Ok((self, true))
+            }
         }
 
-        fn data(
-            self,
-            channel: ChannelId,
-            data: &[u8],
-            mut session: client::Session,
-        ) -> Self::FutureUnit {
-            assert_eq!(data, &b"hello world!"[..]);
-            session.data(channel, CryptoVec::from_slice(&b"hey there!"[..]));
-            self.finished(session)
+        struct ServerHandle {
+            channel: Option<tokio::sync::oneshot::Sender<Channel<server::Msg>>>,
         }
+
+        impl ServerHandle {
+            fn get_channel_waiter(
+                &mut self,
+            ) -> tokio::sync::oneshot::Receiver<Channel<server::Msg>> {
+                let (tx, rx) = tokio::sync::oneshot::channel::<Channel<server::Msg>>();
+                self.channel = Some(tx);
+                rx
+            }
+        }
+
+        #[async_trait]
+        impl server::Handler for ServerHandle {
+            type Error = crate::Error;
+
+            async fn auth_publickey(
+                self,
+                _: &str,
+                _: &russh_keys::key::PublicKey,
+            ) -> Result<(Self, server::Auth), Self::Error> {
+                Ok((self, server::Auth::Accept))
+            }
+
+            async fn channel_open_session(
+                mut self,
+                channel: Channel<server::Msg>,
+                session: server::Session,
+            ) -> Result<(Self, bool, Session), Self::Error> {
+                if let Some(a) = self.channel.take() {
+                    println!("channel open session {:?}", a);
+                    a.send(channel).unwrap();
+                }
+                Ok((self, true, session))
+            }
+        }
+
+        let mut sh = ServerHandle { channel: None };
+        let scw = sh.get_channel_waiter();
+
+        test_session(
+            Client {},
+            sh,
+            |client| async move {
+                let ch = client.channel_open_session().await.unwrap();
+                let mut stream = ch.into_stream();
+                stream.write_all(&b"request"[..]).await.unwrap();
+
+                let mut buf = Vec::new();
+                stream.read_buf(&mut buf).await.unwrap();
+                assert_eq!(&buf, &b"response"[..]);
+
+                stream.write_all(&b"reply"[..]).await.unwrap();
+
+                client
+            },
+            |server| async move {
+                let channel = scw.await.unwrap();
+                let mut stream = channel.into_stream();
+
+                let mut buf = Vec::new();
+                stream.read_buf(&mut buf).await.unwrap();
+                assert_eq!(&buf, &b"request"[..]);
+
+                stream.write_all(&b"response"[..]).await.unwrap();
+
+                buf.clear();
+
+                stream.read_buf(&mut buf).await.unwrap();
+                assert_eq!(&buf, &b"reply"[..]);
+
+                server
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_channel_objects() {
+        #[derive(Debug)]
+        struct Client {}
+
+        #[async_trait]
+        impl client::Handler for Client {
+            type Error = crate::Error;
+
+            async fn check_server_key(
+                self,
+                _server_public_key: &russh_keys::key::PublicKey,
+            ) -> Result<(Self, bool), Self::Error> {
+                Ok((self, true))
+            }
+        }
+
+        struct ServerHandle {}
+
+        impl ServerHandle {}
+
+        #[async_trait]
+        impl server::Handler for ServerHandle {
+            type Error = crate::Error;
+
+            async fn auth_publickey(
+                self,
+                _: &str,
+                _: &russh_keys::key::PublicKey,
+            ) -> Result<(Self, server::Auth), Self::Error> {
+                Ok((self, server::Auth::Accept))
+            }
+
+            async fn channel_open_session(
+                self,
+                mut channel: Channel<server::Msg>,
+                session: Session,
+            ) -> Result<(Self, bool, Session), Self::Error> {
+                tokio::spawn(async move {
+                    while let Some(msg) = channel.wait().await {
+                        match msg {
+                            ChannelMsg::Data { data } => {
+                                channel.data(&data[..]).await.unwrap();
+                                channel.close().await.unwrap();
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                });
+                Ok((self, true, session))
+            }
+        }
+
+        let sh = ServerHandle {};
+        test_session(
+            Client {},
+            sh,
+            |c| async move {
+                let mut ch = c.channel_open_session().await.unwrap();
+                ch.data(&b"hello world!"[..]).await.unwrap();
+
+                let msg = ch.wait().await.unwrap();
+                if let ChannelMsg::Data { data } = msg {
+                    assert_eq!(data.as_ref(), &b"hey there!"[..]);
+                } else {
+                    panic!("Unexpected message {:?}", msg);
+                }
+
+                let msg = ch.wait().await.unwrap();
+                let ChannelMsg::Close = msg else {
+                    panic!("Unexpected message {:?}", msg);
+                };
+
+                ch.close().await.unwrap();
+                c
+            },
+            |s| async move { s },
+        )
+        .await;
     }
 }

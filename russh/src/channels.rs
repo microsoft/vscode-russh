@@ -1,10 +1,12 @@
 use russh_cryptovec::CryptoVec;
 use tokio::sync::mpsc::{Sender, UnboundedReceiver};
+use log::debug;
 
-use crate::{ChannelId, Error, Pty, Sig};
+use crate::{ChannelId, ChannelOpenFailure, ChannelStream, Error, Pty, Sig};
 
 #[derive(Debug)]
 #[non_exhaustive]
+/// Possible messages that [Channel::wait] can receive.
 pub enum ChannelMsg {
     Open {
         id: ChannelId,
@@ -36,7 +38,7 @@ pub enum ChannelMsg {
     /// (client only)
     Exec {
         want_reply: bool,
-        command: String,
+        command: Vec<u8>,
     },
     /// (client only)
     Signal {
@@ -98,8 +100,12 @@ pub enum ChannelMsg {
     Failure,
     /// (server only)
     Close,
+    OpenFailure(ChannelOpenFailure),
 }
 
+/// A handle to a session channel.
+///
+/// Allows you to read and write from a channel without borrowing the session
 pub struct Channel<Send: From<(ChannelId, ChannelMsg)>> {
     pub(crate) id: ChannelId,
     pub(crate) sender: Sender<Send>,
@@ -114,7 +120,7 @@ impl<T: From<(ChannelId, ChannelMsg)>> std::fmt::Debug for Channel<T> {
     }
 }
 
-impl<Send: From<(ChannelId, ChannelMsg)>> Channel<Send> {
+impl<S: From<(ChannelId, ChannelMsg)> + Send + 'static> Channel<S> {
     pub fn id(&self) -> ChannelId {
         self.id
     }
@@ -160,7 +166,7 @@ impl<Send: From<(ChannelId, ChannelMsg)>> Channel<Send> {
     /// Execute a remote program (will be passed to a shell). This can
     /// be used to implement scp (by calling a remote scp and
     /// tunneling to its standard input).
-    pub async fn exec<A: Into<String>>(
+    pub async fn exec<A: Into<Vec<u8>>>(
         &mut self,
         want_reply: bool,
         command: A,
@@ -299,7 +305,15 @@ impl<Send: From<(ChannelId, ChannelMsg)>> Channel<Send> {
                 self.window_size, self.max_packet_size, total
             );
             let sendable = self.window_size.min(self.max_packet_size) as usize;
+
             debug!("sendable {:?}", sendable);
+
+            // If we can not send anymore, continue
+            // and wait for server window adjustment
+            if sendable == 0 {
+                continue;
+            }
+
             let mut c = CryptoVec::new_zeroed(sendable);
             let n = data.read(&mut c[..]).await?;
             total += n;
@@ -334,7 +348,7 @@ impl<Send: From<(ChannelId, ChannelMsg)>> Channel<Send> {
     pub async fn wait(&mut self) -> Option<ChannelMsg> {
         match self.receiver.recv().await {
             Some(ChannelMsg::WindowAdjusted { new_size }) => {
-                self.window_size += new_size;
+                self.window_size = new_size;
                 Some(ChannelMsg::WindowAdjusted { new_size })
             }
             Some(msg) => Some(msg),
@@ -347,5 +361,53 @@ impl<Send: From<(ChannelId, ChannelMsg)>> Channel<Send> {
             .send((self.id, msg).into())
             .await
             .map_err(|_| Error::SendError)
+    }
+
+    /// Request that the channel be closed.
+    pub async fn close(&self) -> Result<(), Error> {
+        self.send_msg(ChannelMsg::Close).await?;
+        Ok(())
+    }
+
+    pub fn into_stream(mut self) -> ChannelStream {
+        let (stream, mut r_rx, w_tx) = ChannelStream::new();
+
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    data = r_rx.recv() => {
+                        match data {
+                            Some(data) if !data.is_empty() => self.data(&data[..]).await?,
+                            Some(_) => {
+                                log::debug!("closing chan {:?}, received empty data", &self.id);
+                                self.eof().await?;
+                                self.close().await?;
+                                break;
+                            },
+                            None => {
+                                self.close().await?;
+                                break
+                            }
+                        }
+                    },
+                    msg = self.wait() => {
+                        match msg {
+                            Some(ChannelMsg::Data { data }) => {
+                                w_tx.send(data[..].into()).map_err(|_| crate::Error::SendError)?;
+                            }
+                            Some(ChannelMsg::Eof) => {
+                                // Send a 0-length chunk to indicate EOF.
+                                w_tx.send("".into()).map_err(|_| crate::Error::SendError)?;
+                                break
+                            }
+                            None => break,
+                            _ => (),
+                        }
+                    }
+                }
+            }
+            Ok::<_, crate::Error>(())
+        });
+        stream
     }
 }

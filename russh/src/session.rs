@@ -18,6 +18,7 @@ use std::fmt::{Debug, Formatter};
 use std::num::Wrapping;
 
 use byteorder::{BigEndian, ByteOrder};
+use log::{debug, trace};
 use russh_cryptovec::CryptoVec;
 use russh_keys::encoding::Encoding;
 
@@ -55,6 +56,7 @@ pub(crate) struct CommonSession<Config> {
     pub config: Config,
     pub encrypted: Option<Encrypted>,
     pub auth_method: Option<auth::Method>,
+    pub(crate) auth_attempts: usize,
     pub write_buffer: SSHBuffer,
     pub kex: Option<Kex>,
     pub cipher: cipher::CipherPair,
@@ -146,6 +148,11 @@ impl Encrypted {
 
     pub fn eof(&mut self, channel: ChannelId) {
         self.byte(channel, msg::CHANNEL_EOF);
+    }
+
+    pub fn close(&mut self, channel: ChannelId) {
+        self.byte(channel, msg::CHANNEL_CLOSE);
+        self.channels.remove(&channel);
     }
 
     pub fn sender_window_size(&self, channel: ChannelId) -> usize {
@@ -276,6 +283,8 @@ impl Encrypted {
             if buf_len < buf0.len() {
                 channel.pending_data.push_back((buf0, None, buf_len))
             }
+        } else {
+            debug!("{:?} not saved for this session", channel);
         }
     }
 
@@ -421,7 +430,7 @@ impl Exchange {
 }
 
 #[derive(Debug)]
-pub enum Kex {
+pub(crate) enum Kex {
     /// Version number sent. `algo` and `sent` tell wether kexinit has
     /// been received, and sent, respectively.
     Init(KexInit),
@@ -438,7 +447,7 @@ pub enum Kex {
 }
 
 #[derive(Debug)]
-pub struct KexInit {
+pub(crate) struct KexInit {
     pub algo: Option<negotiation::Names>,
     pub exchange: Exchange,
     pub session_id: Option<CryptoVec>,
@@ -476,14 +485,14 @@ impl KexInit {
 }
 
 #[derive(Debug)]
-pub struct KexDh {
+pub(crate) struct KexDh {
     pub exchange: Exchange,
     pub names: negotiation::Names,
     pub key: usize,
     pub session_id: Option<CryptoVec>,
 }
 
-pub struct KexDhDone {
+pub(crate) struct KexDhDone {
     pub exchange: Exchange,
     pub kex: Box<dyn KexAlgorithm + Send>,
     pub key: usize,
@@ -528,20 +537,18 @@ impl KexDhDone {
             key: self.key,
             cipher: c,
             session_id,
-            received: false,
             sent: false,
         })
     }
 }
 
 #[derive(Debug)]
-pub struct NewKeys {
+pub(crate) struct NewKeys {
     pub exchange: Exchange,
     pub names: negotiation::Names,
     pub kex: Box<dyn KexAlgorithm + Send>,
     pub key: usize,
     pub cipher: cipher::CipherPair,
     pub session_id: CryptoVec,
-    pub received: bool,
     pub sent: bool,
 }
