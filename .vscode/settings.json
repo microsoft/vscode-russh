@@ -1,0 +1,7 @@
+{
+  "rust-analyzer.cargo.features": [
+    "openssl",
+  ],
+  "rust-analyzer.cargo.noDefaultFeatures": true,
+  "rust-analyzer.check.noDefaultFeatures": true,
+}

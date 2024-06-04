@@ -13,8 +13,10 @@
 // limitations under the License.
 //
 use russh_cryptovec::CryptoVec;
+use russh_keys::ec;
 use russh_keys::encoding::*;
 use russh_keys::key::*;
+use russh_keys::protocol;
 
 #[doc(hidden)]
 pub trait PubKey {
@@ -30,16 +32,14 @@ impl PubKey for PublicKey {
                 buffer.extend_ssh_string(ED25519.0.as_bytes());
                 buffer.extend_ssh_string(public.as_bytes());
             }
-            #[cfg(feature = "openssl")]
             PublicKey::RSA { ref key, .. } => {
-                #[allow(clippy::unwrap_used)] // type known
-                let rsa = key.0.rsa().unwrap();
-                let e = rsa.e().to_vec();
-                let n = rsa.n().to_vec();
-                buffer.push_u32_be((4 + SSH_RSA.0.len() + mpint_len(&n) + mpint_len(&e)) as u32);
-                buffer.extend_ssh_string(SSH_RSA.0.as_bytes());
-                buffer.extend_ssh_mpint(&e);
-                buffer.extend_ssh_mpint(&n);
+                buffer.extend_wrapped(|buffer| {
+                    buffer.extend_ssh_string(SSH_RSA.0.as_bytes());
+                    buffer.extend_ssh(&protocol::RsaPublicKey::from(key));
+                });
+            }
+            PublicKey::EC { ref key } => {
+                write_ec_public_key(buffer, key);
             }
         }
     }
@@ -50,20 +50,31 @@ impl PubKey for KeyPair {
         match self {
             #[cfg(feature = "rs-crypto")]
             KeyPair::Ed25519(ref key) => {
-                let public = key.public.as_bytes();
+                let public = key.verifying_key().to_bytes();
                 buffer.push_u32_be((ED25519.0.len() + public.len() + 8) as u32);
                 buffer.extend_ssh_string(ED25519.0.as_bytes());
-                buffer.extend_ssh_string(public);
+                buffer.extend_ssh_string(public.as_slice());
             }
-            #[cfg(feature = "openssl")]
             KeyPair::RSA { ref key, .. } => {
-                let e = key.e().to_vec();
-                let n = key.n().to_vec();
-                buffer.push_u32_be((4 + SSH_RSA.0.len() + mpint_len(&n) + mpint_len(&e)) as u32);
-                buffer.extend_ssh_string(SSH_RSA.0.as_bytes());
-                buffer.extend_ssh_mpint(&e);
-                buffer.extend_ssh_mpint(&n);
+                buffer.extend_wrapped(|buffer| {
+                    buffer.extend_ssh_string(SSH_RSA.0.as_bytes());
+                    buffer.extend_ssh(&protocol::RsaPublicKey::from(key));
+                });
+            }
+            KeyPair::EC { ref key } => {
+                write_ec_public_key(buffer, &key.to_public_key());
             }
         }
     }
+}
+
+pub(crate) fn write_ec_public_key(buf: &mut CryptoVec, key: &ec::PublicKey) {
+    let algorithm = key.algorithm().as_bytes();
+    let ident = key.ident().as_bytes();
+    let q = key.to_sec1_bytes();
+
+    buf.push_u32_be((algorithm.len() + ident.len() + q.len() + 12) as u32);
+    buf.extend_ssh_string(algorithm);
+    buf.extend_ssh_string(ident);
+    buf.extend_ssh_string(&q);
 }

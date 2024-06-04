@@ -1,8 +1,8 @@
 use byteorder::{BigEndian, ByteOrder};
-use log::debug;
 use curve25519_dalek::constants::ED25519_BASEPOINT_TABLE;
 use curve25519_dalek::montgomery::MontgomeryPoint;
 use curve25519_dalek::scalar::Scalar;
+use log::debug;
 use russh_cryptovec::CryptoVec;
 use russh_keys::encoding::Encoding;
 
@@ -72,7 +72,7 @@ impl KexAlgorithm for Curve25519Kex {
         };
 
         let server_secret = Scalar::from_bytes_mod_order(rand::random::<[u8; 32]>());
-        let server_pubkey = (&ED25519_BASEPOINT_TABLE * &server_secret).to_montgomery();
+        let server_pubkey = (ED25519_BASEPOINT_TABLE * &server_secret).to_montgomery();
 
         // fill exchange.
         exchange.server_ephemeral.clear();
@@ -89,7 +89,7 @@ impl KexAlgorithm for Curve25519Kex {
         buf: &mut CryptoVec,
     ) -> Result<(), crate::Error> {
         let client_secret = Scalar::from_bytes_mod_order(rand::random::<[u8; 32]>());
-        let client_pubkey = (&ED25519_BASEPOINT_TABLE * &client_secret).to_montgomery();
+        let client_pubkey = (ED25519_BASEPOINT_TABLE * &client_secret).to_montgomery();
 
         // fill exchange.
         client_ephemeral.clear();
@@ -103,9 +103,7 @@ impl KexAlgorithm for Curve25519Kex {
     }
 
     fn compute_shared_secret(&mut self, remote_pubkey_: &[u8]) -> Result<(), crate::Error> {
-        let local_secret =
-            std::mem::replace(&mut self.local_secret, None).ok_or(crate::Error::KexInit)?;
-
+        let local_secret = self.local_secret.take().ok_or(crate::Error::KexInit)?;
         let mut remote_pubkey = MontgomeryPoint([0; 32]);
         remote_pubkey.0.clone_from_slice(remote_pubkey_);
         let shared = local_secret * remote_pubkey;

@@ -12,14 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-use serde::{Serialize, Deserialize};
-#[cfg(feature = "openssl")]
-use openssl::pkey::{Private, Public};
-use russh_cryptovec::CryptoVec;
+use std::borrow::Cow;
+use std::convert::{TryFrom, TryInto};
 
+#[cfg(feature = "rs-crypto")]
+use ed25519_dalek::{Signer, Verifier};
+use russh_cryptovec::CryptoVec;
+use serde::{Deserialize, Serialize};
+
+use crate::backend;
+use crate::ec;
 use crate::encoding::{Encoding, Reader};
+use crate::protocol;
 pub use crate::signature::*;
 use crate::Error;
+
+pub use backend::{RsaPrivate, RsaPublic};
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
 /// Name of a public key algorithm.
@@ -31,6 +39,12 @@ impl AsRef<str> for Name {
     }
 }
 
+/// The name of the ecdsa-sha2-nistp256 algorithm for SSH.
+pub const ECDSA_SHA2_NISTP256: Name = Name("ecdsa-sha2-nistp256");
+/// The name of the ecdsa-sha2-nistp384 algorithm for SSH.
+pub const ECDSA_SHA2_NISTP384: Name = Name("ecdsa-sha2-nistp384");
+/// The name of the ecdsa-sha2-nistp521 algorithm for SSH.
+pub const ECDSA_SHA2_NISTP521: Name = Name("ecdsa-sha2-nistp521");
 /// The name of the Ed25519 algorithm for SSH.
 pub const ED25519: Name = Name("ssh-ed25519");
 /// The name of the ssh-sha2-512 algorithm for SSH.
@@ -46,6 +60,7 @@ impl Name {
     /// Base name of the private key file for a key name.
     pub fn identity_file(&self) -> &'static str {
         match *self {
+            ECDSA_SHA2_NISTP256 | ECDSA_SHA2_NISTP384 | ECDSA_SHA2_NISTP521 => "id_ecdsa",
             ED25519 => "id_ed25519",
             RSA_SHA2_512 => "id_rsa",
             RSA_SHA2_256 => "id_rsa",
@@ -81,23 +96,12 @@ impl SignatureHash {
         }
     }
 
-    #[cfg(feature = "openssl")]
-    fn message_digest(&self) -> openssl::hash::MessageDigest {
-        use openssl::hash::MessageDigest;
-        match *self {
-            SignatureHash::SHA2_256 => MessageDigest::sha256(),
-            SignatureHash::SHA2_512 => MessageDigest::sha512(),
-            SignatureHash::SHA1 => MessageDigest::sha1(),
-        }
-    }
-
     pub fn from_rsa_hostkey_algo(algo: &[u8]) -> Option<Self> {
-        if algo == b"rsa-sha2-256" {
-            Some(Self::SHA2_256)
-        } else if algo == b"rsa-sha2-512" {
-            Some(Self::SHA2_512)
-        } else {
-            Some(Self::SHA1)
+        match algo {
+            b"rsa-sha2-256" => Some(Self::SHA2_256),
+            b"rsa-sha2-512" => Some(Self::SHA2_512),
+            b"ssh-rsa" => Some(Self::SHA1),
+            _ => None,
         }
     }
 }
@@ -107,101 +111,57 @@ impl SignatureHash {
 pub enum PublicKey {
     #[doc(hidden)]
     #[cfg(feature = "rs-crypto")]
-    Ed25519(ed25519_dalek::PublicKey),
+    Ed25519(ed25519_dalek::VerifyingKey),
     #[doc(hidden)]
-    #[cfg(feature = "openssl")]
     RSA {
-        key: OpenSSLPKey,
+        key: backend::RsaPublic,
         hash: SignatureHash,
     },
+    #[doc(hidden)]
+    EC { key: ec::PublicKey },
 }
 
 impl PartialEq for PublicKey {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            #[cfg(feature = "openssl")]
             (Self::RSA { key: a, .. }, Self::RSA { key: b, .. }) => a == b,
             #[cfg(feature = "rs-crypto")]
             (Self::Ed25519(a), Self::Ed25519(b)) => a == b,
+            (Self::EC { key: a }, Self::EC { key: b }) => a == b,
             #[allow(unreachable_patterns)]
             _ => false,
         }
     }
 }
 
-/// A public key from OpenSSL.
-#[cfg(feature = "openssl")]
-#[derive(Clone)]
-pub struct OpenSSLPKey(pub openssl::pkey::PKey<Public>);
-
-#[cfg(feature = "openssl")]
-use std::cmp::{Eq, PartialEq};
-#[cfg(feature = "openssl")]
-impl PartialEq for OpenSSLPKey {
-    fn eq(&self, b: &OpenSSLPKey) -> bool {
-        self.0.public_eq(&b.0)
-    }
-}
-#[cfg(feature = "openssl")]
-impl Eq for OpenSSLPKey {}
-#[cfg(feature = "openssl")]
-impl std::fmt::Debug for OpenSSLPKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "OpenSSLPKey {{ (hidden) }}")
-    }
-}
-
 impl PublicKey {
     /// Parse a public key in SSH format.
     pub fn parse(algo: &[u8], pubkey: &[u8]) -> Result<Self, Error> {
-        match algo {
-            #[cfg(feature = "rs-crypto")]
-            b"ssh-ed25519" => {
-                let mut p = pubkey.reader(0);
-                let key_algo = p.read_string()?;
-                let key_bytes = p.read_string()?;
-                if key_algo != b"ssh-ed25519" || key_bytes.len() != ed25519_dalek::PUBLIC_KEY_LENGTH
-                {
-                    return Err(Error::CouldNotReadKey);
-                }
-                ed25519_dalek::PublicKey::from_bytes(key_bytes)
-                    .map(PublicKey::Ed25519)
-                    .map_err(Error::from)
+        use ssh_encoding::Decode;
+        let key_data = &ssh_key::public::KeyData::decode(&mut pubkey.reader(0))?;
+        let key_algo = key_data.algorithm();
+        let key_algo = key_algo.as_str().as_bytes();
+        if key_algo == b"ssh-rsa" {
+            if algo != SSH_RSA.as_ref().as_bytes()
+                && algo != RSA_SHA2_256.as_ref().as_bytes()
+                && algo != RSA_SHA2_512.as_ref().as_bytes()
+            {
+                return Err(Error::KeyIsCorrupt);
             }
-            b"ssh-rsa" | b"rsa-sha2-256" | b"rsa-sha2-512" if cfg!(feature = "openssl") => {
-                #[cfg(feature = "openssl")]
-                {
-                    use log::debug;
-                    let mut p = pubkey.reader(0);
-                    let key_algo = p.read_string()?;
-                    debug!("{:?}", std::str::from_utf8(key_algo));
-                    if key_algo != b"ssh-rsa"
-                        && key_algo != b"rsa-sha2-256"
-                        && key_algo != b"rsa-sha2-512"
-                    {
-                        return Err(Error::CouldNotReadKey);
-                    }
-                    let key_e = p.read_string()?;
-                    let key_n = p.read_string()?;
-                    use openssl::bn::BigNum;
-                    use openssl::pkey::PKey;
-                    use openssl::rsa::Rsa;
-                    Ok(PublicKey::RSA {
-                        key: OpenSSLPKey(PKey::from_rsa(Rsa::from_public_components(
-                            BigNum::from_slice(key_n)?,
-                            BigNum::from_slice(key_e)?,
-                        )?)?),
-                        hash: SignatureHash::from_rsa_hostkey_algo(algo)
-                            .unwrap_or(SignatureHash::SHA1),
-                    })
-                }
-                #[cfg(not(feature = "openssl"))]
-                {
-                    unreachable!()
-                }
-            }
-            _ => Err(Error::CouldNotReadKey),
+        } else if key_algo != algo {
+            return Err(Error::KeyIsCorrupt);
         }
+        Self::try_from(key_data)
+    }
+
+    pub fn new_rsa_with_hash(
+        pk: &protocol::RsaPublicKey<'_>,
+        hash: SignatureHash,
+    ) -> Result<Self, Error> {
+        Ok(PublicKey::RSA {
+            key: RsaPublic::try_from(pk)?,
+            hash,
+        })
     }
 
     /// Algorithm name for that key.
@@ -209,8 +169,8 @@ impl PublicKey {
         match *self {
             #[cfg(feature = "rs-crypto")]
             PublicKey::Ed25519(_) => ED25519.0,
-            #[cfg(feature = "openssl")]
             PublicKey::RSA { ref hash, .. } => hash.name().0,
+            PublicKey::EC { ref key } => key.algorithm(),
         }
     }
 
@@ -219,23 +179,14 @@ impl PublicKey {
         match self {
             #[cfg(feature = "rs-crypto")]
             PublicKey::Ed25519(ref public) => {
-                use ed25519_dalek::Verifier;
-
-                ed25519_dalek::Signature::from_bytes(sig)
-                    .and_then(|sig| public.verify(buffer, &sig))
-                    .is_ok()
-            }
-
-            #[cfg(feature = "openssl")]
-            PublicKey::RSA { ref key, ref hash } => {
-                use openssl::sign::*;
-                let verify = || {
-                    let mut verifier = Verifier::new(hash.message_digest(), &key.0)?;
-                    verifier.update(buffer)?;
-                    verifier.verify(sig)
+                let Ok(sig) = ed25519_dalek::ed25519::SignatureBytes::try_from(sig) else {
+                    return false;
                 };
-                verify().unwrap_or(false)
+                let sig = ed25519_dalek::Signature::from_bytes(&sig);
+                public.verify(buffer, &sig).is_ok()
             }
+            PublicKey::RSA { ref key, ref hash } => key.verify_detached(hash, buffer, sig),
+            PublicKey::EC { ref key, .. } => ec_verify(key, buffer, sig).is_ok(),
         }
     }
 
@@ -249,22 +200,12 @@ impl PublicKey {
         data_encoding::BASE64_NOPAD.encode(&hasher.finalize())
     }
 
-    #[cfg(feature = "openssl")]
-    pub fn set_algorithm(&mut self, algorithm: &[u8]) {
+    pub fn set_algorithm(&mut self, algorithm: SignatureHash) {
         #[allow(irrefutable_let_patterns)] // depending on the build flag, it may be refutable
         if let PublicKey::RSA { ref mut hash, .. } = self {
-            if algorithm == b"rsa-sha2-512" {
-                *hash = SignatureHash::SHA2_512
-            } else if algorithm == b"rsa-sha2-256" {
-                *hash = SignatureHash::SHA2_256
-            } else if algorithm == b"ssh-rsa" {
-                *hash = SignatureHash::SHA1
-            }
+            *hash = algorithm;
         }
     }
-
-    #[cfg(not(feature = "openssl"))]
-    pub fn set_algorithm(&mut self, _: &[u8]) {}
 }
 
 impl Verify for PublicKey {
@@ -280,11 +221,13 @@ impl Verify for PublicKey {
 #[allow(clippy::large_enum_variant)]
 pub enum KeyPair {
     #[cfg(feature = "rs-crypto")]
-    Ed25519(ed25519_dalek::Keypair),
-    #[cfg(feature = "openssl")]
+    Ed25519(ed25519_dalek::SigningKey),
     RSA {
-        key: openssl::rsa::Rsa<Private>,
+        key: backend::RsaPrivate,
         hash: SignatureHash,
+    },
+    EC {
+        key: ec::PrivateKey,
     },
 }
 
@@ -293,15 +236,14 @@ impl Clone for KeyPair {
         match self {
             #[allow(clippy::expect_used)]
             #[cfg(feature = "rs-crypto")]
-            Self::Ed25519(kp) => Self::Ed25519(
-                ed25519_dalek::Keypair::from_bytes(&kp.to_bytes())
-                    .expect("expected to clone keypair"),
-            ),
-            #[cfg(feature = "openssl")]
+            Self::Ed25519(kp) => {
+                Self::Ed25519(ed25519_dalek::SigningKey::from_bytes(&kp.to_bytes()))
+            }
             Self::RSA { key, hash } => Self::RSA {
                 key: key.clone(),
                 hash: *hash,
             },
+            Self::EC { key } => Self::EC { key: key.clone() },
         }
     }
 }
@@ -313,10 +255,10 @@ impl std::fmt::Debug for KeyPair {
             KeyPair::Ed25519(ref key) => write!(
                 f,
                 "Ed25519 {{ public: {:?}, secret: (hidden) }}",
-                key.public.as_bytes()
+                key.verifying_key().as_bytes()
             ),
-            #[cfg(feature = "openssl")]
             KeyPair::RSA { .. } => write!(f, "RSA {{ (hidden) }}"),
+            KeyPair::EC { .. } => write!(f, "EC {{ (hidden) }}"),
         }
     }
 }
@@ -328,21 +270,29 @@ impl<'b> crate::encoding::Bytes for &'b KeyPair {
 }
 
 impl KeyPair {
+    pub fn new_rsa_with_hash(
+        sk: &protocol::RsaPrivateKey<'_>,
+        extra: Option<&RsaCrtExtra<'_>>,
+        hash: SignatureHash,
+    ) -> Result<KeyPair, Error> {
+        Ok(KeyPair::RSA {
+            key: RsaPrivate::new(sk, extra)?,
+            hash,
+        })
+    }
+
     /// Copy the public key of this algorithm.
     pub fn clone_public_key(&self) -> Result<PublicKey, Error> {
         Ok(match self {
             #[cfg(feature = "rs-crypto")]
-            KeyPair::Ed25519(ref key) => PublicKey::Ed25519(key.public),
-            #[cfg(feature = "openssl")]
-            KeyPair::RSA { ref key, ref hash } => {
-                use openssl::pkey::PKey;
-                use openssl::rsa::Rsa;
-                let key = Rsa::from_public_components(key.n().to_owned()?, key.e().to_owned()?)?;
-                PublicKey::RSA {
-                    key: OpenSSLPKey(PKey::from_rsa(key)?),
-                    hash: *hash,
-                }
-            }
+            KeyPair::Ed25519(ref key) => PublicKey::Ed25519(key.verifying_key()),
+            KeyPair::RSA { ref key, ref hash } => PublicKey::RSA {
+                key: key.try_into()?,
+                hash: *hash,
+            },
+            KeyPair::EC { ref key } => PublicKey::EC {
+                key: key.to_public_key(),
+            },
         })
     }
 
@@ -351,26 +301,26 @@ impl KeyPair {
         match *self {
             #[cfg(feature = "rs-crypto")]
             KeyPair::Ed25519(_) => ED25519.0,
-            #[cfg(feature = "openssl")]
             KeyPair::RSA { ref hash, .. } => hash.name().0,
+            KeyPair::EC { ref key } => key.algorithm(),
         }
     }
 
-    /// Generate a key pair.
+    /// Generate a ED25519 key pair.
     #[cfg(feature = "rs-crypto")]
     pub fn generate_ed25519() -> Option<Self> {
         use rand::rngs::OsRng;
-        let keypair = ed25519_dalek::Keypair::generate(&mut OsRng {});
+        let keypair = ed25519_dalek::SigningKey::generate(&mut OsRng {});
         assert_eq!(
-            keypair.public.as_bytes(),
-            ed25519_dalek::PublicKey::from(&keypair.secret).as_bytes()
+            keypair.verifying_key().as_bytes(),
+            ed25519_dalek::VerifyingKey::from(&keypair).as_bytes()
         );
         Some(KeyPair::Ed25519(keypair))
     }
 
-    #[cfg(feature = "openssl")]
+    /// Generate a RSA key pair.
     pub fn generate_rsa(bits: usize, hash: SignatureHash) -> Option<Self> {
-        let key = openssl::rsa::Rsa::generate(bits as u32).ok()?;
+        let key = RsaPrivate::generate(bits).ok()?;
         Some(KeyPair::RSA { key, hash })
     }
 
@@ -379,19 +329,16 @@ impl KeyPair {
         match self {
             #[allow(clippy::unwrap_used)]
             #[cfg(feature = "rs-crypto")]
-            KeyPair::Ed25519(ref secret) => {
-                use ed25519_dalek::Signer;
-                use std::convert::TryInto;
-                Ok(Signature::Ed25519(SignatureBytes(
-                    ed25519_dalek::ed25519::signature::Signature::as_bytes(&secret.sign(to_sign))
-                        .try_into()
-                        .unwrap(),
-                )))
-            }
-            #[cfg(feature = "openssl")]
+            KeyPair::Ed25519(ref secret) => Ok(Signature::Ed25519(SignatureBytes(
+                secret.sign(to_sign).to_bytes(),
+            ))),
             KeyPair::RSA { ref key, ref hash } => Ok(Signature::RSA {
-                bytes: rsa_signature(hash, key, to_sign)?,
+                bytes: key.sign(hash, to_sign)?,
                 hash: *hash,
+            }),
+            KeyPair::EC { ref key } => Ok(Signature::ECDSA {
+                algorithm: key.algorithm(),
+                signature: ec_signature(key, to_sign)?,
             }),
         }
     }
@@ -408,23 +355,25 @@ impl KeyPair {
         match self {
             #[cfg(feature = "rs-crypto")]
             KeyPair::Ed25519(ref secret) => {
-                use ed25519_dalek::ed25519::signature::Signature as EdSignature;
-                use ed25519_dalek::Signer;
                 let signature = secret.sign(to_sign.as_ref());
 
-                buffer.push_u32_be(
-                    (ED25519.0.len() + EdSignature::as_bytes(&signature).len() + 8) as u32,
-                );
+                buffer.push_u32_be((ED25519.0.len() + signature.to_bytes().len() + 8) as u32);
                 buffer.extend_ssh_string(ED25519.0.as_bytes());
-                buffer.extend_ssh_string(signature.as_bytes());
+                buffer.extend_ssh_string(signature.to_bytes().as_slice());
             }
-            #[cfg(feature = "openssl")]
             KeyPair::RSA { ref key, ref hash } => {
                 // https://tools.ietf.org/html/draft-rsa-dsa-sha2-256-02#section-2.2
-                let signature = rsa_signature(hash, key, to_sign.as_ref())?;
+                let signature = key.sign(hash, to_sign.as_ref())?;
                 let name = hash.name();
                 buffer.push_u32_be((name.0.len() + signature.len() + 8) as u32);
                 buffer.extend_ssh_string(name.0.as_bytes());
+                buffer.extend_ssh_string(&signature);
+            }
+            KeyPair::EC { ref key } => {
+                let algorithm = key.algorithm().as_bytes();
+                let signature = ec_signature(key, to_sign.as_ref())?;
+                buffer.push_u32_be((algorithm.len() + signature.len() + 8) as u32);
+                buffer.extend_ssh_string(algorithm);
                 buffer.extend_ssh_string(&signature);
             }
         }
@@ -439,21 +388,24 @@ impl KeyPair {
         match self {
             #[cfg(feature = "rs-crypto")]
             KeyPair::Ed25519(ref secret) => {
-                use ed25519_dalek::ed25519::signature::Signature;
-                use ed25519_dalek::Signer;
-
                 let signature = secret.sign(buffer);
-                buffer.push_u32_be((ED25519.0.len() + signature.as_bytes().len() + 8) as u32);
+                buffer.push_u32_be((ED25519.0.len() + signature.to_bytes().len() + 8) as u32);
                 buffer.extend_ssh_string(ED25519.0.as_bytes());
-                buffer.extend_ssh_string(signature.as_bytes());
+                buffer.extend_ssh_string(signature.to_bytes().as_slice());
             }
-            #[cfg(feature = "openssl")]
             KeyPair::RSA { ref key, ref hash } => {
                 // https://tools.ietf.org/html/draft-rsa-dsa-sha2-256-02#section-2.2
-                let signature = rsa_signature(hash, key, buffer)?;
+                let signature = key.sign(hash, buffer)?;
                 let name = hash.name();
                 buffer.push_u32_be((name.0.len() + signature.len() + 8) as u32);
                 buffer.extend_ssh_string(name.0.as_bytes());
+                buffer.extend_ssh_string(&signature);
+            }
+            KeyPair::EC { ref key } => {
+                let signature = ec_signature(key, buffer)?;
+                let algorithm = key.algorithm().as_bytes();
+                buffer.push_u32_be((algorithm.len() + signature.len() + 8) as u32);
+                buffer.extend_ssh_string(algorithm);
                 buffer.extend_ssh_string(&signature);
             }
         }
@@ -461,74 +413,69 @@ impl KeyPair {
     }
 
     /// Create a copy of an RSA key with a specified hash algorithm.
-    #[cfg(feature = "openssl")]
     pub fn with_signature_hash(&self, hash: SignatureHash) -> Option<Self> {
         match self {
             #[cfg(feature = "rs-crypto")]
             KeyPair::Ed25519(_) => None,
-            #[cfg(feature = "openssl")]
             KeyPair::RSA { key, .. } => Some(KeyPair::RSA {
                 key: key.clone(),
                 hash,
             }),
+            KeyPair::EC { .. } => None,
         }
     }
 }
 
-#[cfg(feature = "openssl")]
-fn rsa_signature(
-    hash: &SignatureHash,
-    key: &openssl::rsa::Rsa<Private>,
-    b: &[u8],
-) -> Result<Vec<u8>, Error> {
-    use openssl::pkey::*;
-    use openssl::rsa::*;
-    use openssl::sign::Signer;
-    let pkey = PKey::from_rsa(Rsa::from_private_components(
-        key.n().to_owned()?,
-        key.e().to_owned()?,
-        key.d().to_owned()?,
-        key.p().ok_or(Error::KeyIsCorrupt)?.to_owned()?,
-        key.q().ok_or(Error::KeyIsCorrupt)?.to_owned()?,
-        key.dmp1().ok_or(Error::KeyIsCorrupt)?.to_owned()?,
-        key.dmq1().ok_or(Error::KeyIsCorrupt)?.to_owned()?,
-        key.iqmp().ok_or(Error::KeyIsCorrupt)?.to_owned()?,
-    )?)?;
-    let mut signer = Signer::new(hash.message_digest(), &pkey)?;
-    signer.update(b)?;
-    Ok(signer.sign_to_vec()?)
+/// Extra CRT parameters for RSA private key.
+pub struct RsaCrtExtra<'a> {
+    /// `d mod (p-1)`.
+    pub dp: Cow<'a, [u8]>,
+    /// `d mod (q-1)`.
+    pub dq: Cow<'a, [u8]>,
+}
+
+impl Drop for RsaCrtExtra<'_> {
+    fn drop(&mut self) {
+        zeroize_cow(&mut self.dp);
+        zeroize_cow(&mut self.dq);
+    }
+}
+
+fn ec_signature(key: &ec::PrivateKey, b: &[u8]) -> Result<Vec<u8>, Error> {
+    let (r, s) = key.try_sign(b)?;
+    let mut buf = Vec::new();
+    buf.extend_ssh_mpint(&r);
+    buf.extend_ssh_mpint(&s);
+    Ok(buf)
+}
+
+fn ec_verify(key: &ec::PublicKey, b: &[u8], sig: &[u8]) -> Result<(), Error> {
+    let mut reader = sig.reader(0);
+    key.verify(b, reader.read_mpint()?, reader.read_mpint()?)
 }
 
 /// Parse a public key from a byte slice.
-pub fn parse_public_key(
-    p: &[u8],
-    #[cfg(feature = "openssl")] prefer_hash: Option<SignatureHash>,
-) -> Result<PublicKey, Error> {
-    let mut pos = p.reader(0);
-    let t = pos.read_string()?;
-    #[cfg(feature = "rs-crypto")]
-    if t == b"ssh-ed25519" {
-        if let Ok(pubkey) = pos.read_string() {
-            let p = ed25519_dalek::PublicKey::from_bytes(pubkey).map_err(Error::from)?;
-            return Ok(PublicKey::Ed25519(p));
-        }
+pub fn parse_public_key(p: &[u8], prefer_hash: Option<SignatureHash>) -> Result<PublicKey, Error> {
+    use ssh_encoding::Decode;
+    let mut key = PublicKey::try_from(&ssh_key::public::KeyData::decode(&mut p.reader(0))?)?;
+    key.set_algorithm(prefer_hash.unwrap_or(SignatureHash::SHA2_256));
+    Ok(key)
+}
+
+/// Obtain a cryptographic-safe random number generator.
+pub fn safe_rng() -> impl rand::CryptoRng + rand::RngCore {
+    rand::thread_rng()
+}
+
+/// Zeroize `Cow` if value is owned.
+pub(crate) fn zeroize_cow<T>(v: &mut Cow<T>)
+where
+    T: ToOwned + ?Sized,
+    <T as ToOwned>::Owned: zeroize::Zeroize,
+{
+    use zeroize::Zeroize;
+    match v {
+        Cow::Owned(v) => v.zeroize(),
+        Cow::Borrowed(_) => (),
     }
-    if t == b"ssh-rsa" {
-        #[cfg(feature = "openssl")]
-        {
-            let e = pos.read_string()?;
-            let n = pos.read_string()?;
-            use openssl::bn::*;
-            use openssl::pkey::*;
-            use openssl::rsa::*;
-            return Ok(PublicKey::RSA {
-                key: OpenSSLPKey(PKey::from_rsa(Rsa::from_public_components(
-                    BigNum::from_slice(n)?,
-                    BigNum::from_slice(e)?,
-                )?)?),
-                hash: prefer_hash.unwrap_or(SignatureHash::SHA2_256),
-            });
-        }
-    }
-    Err(Error::CouldNotReadKey)
 }

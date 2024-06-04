@@ -1,7 +1,10 @@
 use std::collections::HashMap;
+use std::convert::TryFrom;
+use std::marker::Sync;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime};
 
+use async_trait::async_trait;
 use byteorder::{BigEndian, ByteOrder};
 use futures::future::Future;
 use futures::stream::{Stream, StreamExt};
@@ -12,8 +15,6 @@ use {std, tokio};
 
 use super::{msg, Constraint};
 use crate::encoding::{Encoding, Position, Reader};
-#[cfg(feature = "openssl")]
-use crate::key::SignatureHash;
 use crate::{key, Error};
 
 #[derive(Clone)]
@@ -30,12 +31,27 @@ pub enum ServerError<E> {
     Error(Error),
 }
 
+pub enum MessageType {
+    RequestKeys,
+    AddKeys,
+    RemoveKeys,
+    RemoveAllKeys,
+    Sign,
+    Lock,
+    Unlock,
+}
+
+#[async_trait]
 pub trait Agent: Clone + Send + 'static {
     fn confirm(
         self,
         _pk: Arc<key::KeyPair>,
     ) -> Box<dyn Future<Output = (Self, bool)> + Unpin + Send> {
         Box::new(futures::future::ready((self, true)))
+    }
+
+    async fn confirm_request(&self, _msg: MessageType) -> bool {
+        true
     }
 }
 
@@ -81,7 +97,7 @@ struct Connection<S: AsyncRead + AsyncWrite + Send + 'static, A: Agent> {
     buf: CryptoVec,
 }
 
-impl<S: AsyncRead + AsyncWrite + Send + Unpin + 'static, A: Agent + Send + 'static>
+impl<S: AsyncRead + AsyncWrite + Send + Unpin + 'static, A: Agent + Send + Sync + 'static>
     Connection<S, A>
 {
     async fn run(mut self) -> Result<(), Error> {
@@ -114,8 +130,9 @@ impl<S: AsyncRead + AsyncWrite + Send + Unpin + 'static, A: Agent + Send + 'stat
         };
         writebuf.extend(&[0, 0, 0, 0]);
         let mut r = self.buf.reader(0);
+        let agentref = self.agent.as_ref().ok_or(Error::AgentFailure)?;
         match r.read_byte() {
-            Ok(11) if !is_locked => {
+            Ok(11) if !is_locked && agentref.confirm_request(MessageType::RequestKeys).await => {
                 // request identities
                 if let Ok(keys) = self.keys.0.read() {
                     writebuf.push(msg::IDENTITIES_ANSWER);
@@ -128,7 +145,7 @@ impl<S: AsyncRead + AsyncWrite + Send + Unpin + 'static, A: Agent + Send + 'stat
                     writebuf.push(msg::FAILURE)
                 }
             }
-            Ok(13) if !is_locked => {
+            Ok(13) if !is_locked && agentref.confirm_request(MessageType::Sign).await => {
                 // sign request
                 let agent = self.agent.take().ok_or(Error::AgentFailure)?;
                 let (agent, signed) = self.try_sign(agent, r, writebuf).await?;
@@ -140,14 +157,14 @@ impl<S: AsyncRead + AsyncWrite + Send + Unpin + 'static, A: Agent + Send + 'stat
                     writebuf.push(msg::FAILURE)
                 }
             }
-            Ok(17) if !is_locked => {
+            Ok(17) if !is_locked && agentref.confirm_request(MessageType::AddKeys).await => {
                 // add identity
                 if let Ok(true) = self.add_key(r, false, writebuf).await {
                 } else {
                     writebuf.push(msg::FAILURE)
                 }
             }
-            Ok(18) if !is_locked => {
+            Ok(18) if !is_locked && agentref.confirm_request(MessageType::RemoveKeys).await => {
                 // remove identity
                 if let Ok(true) = self.remove_identity(r) {
                     writebuf.push(msg::SUCCESS)
@@ -155,7 +172,7 @@ impl<S: AsyncRead + AsyncWrite + Send + Unpin + 'static, A: Agent + Send + 'stat
                     writebuf.push(msg::FAILURE)
                 }
             }
-            Ok(19) if !is_locked => {
+            Ok(19) if !is_locked && agentref.confirm_request(MessageType::RemoveAllKeys).await => {
                 // remove all identities
                 if let Ok(mut keys) = self.keys.0.write() {
                     keys.clear();
@@ -164,7 +181,7 @@ impl<S: AsyncRead + AsyncWrite + Send + Unpin + 'static, A: Agent + Send + 'stat
                     writebuf.push(msg::FAILURE)
                 }
             }
-            Ok(22) if !is_locked => {
+            Ok(22) if !is_locked && agentref.confirm_request(MessageType::Lock).await => {
                 // lock
                 if let Ok(()) = self.lock(r) {
                     writebuf.push(msg::SUCCESS)
@@ -172,7 +189,7 @@ impl<S: AsyncRead + AsyncWrite + Send + Unpin + 'static, A: Agent + Send + 'stat
                     writebuf.push(msg::FAILURE)
                 }
             }
-            Ok(23) if is_locked => {
+            Ok(23) if is_locked && agentref.confirm_request(MessageType::Unlock).await => {
                 // unlock
                 if let Ok(true) = self.unlock(r) {
                     writebuf.push(msg::SUCCESS)
@@ -180,7 +197,7 @@ impl<S: AsyncRead + AsyncWrite + Send + Unpin + 'static, A: Agent + Send + 'stat
                     writebuf.push(msg::FAILURE)
                 }
             }
-            Ok(25) if !is_locked => {
+            Ok(25) if !is_locked && agentref.confirm_request(MessageType::AddKeys).await => {
                 // add identity constrained
                 if let Ok(true) = self.add_key(r, true, writebuf).await {
                 } else {
@@ -233,91 +250,27 @@ impl<S: AsyncRead + AsyncWrite + Send + Unpin + 'static, A: Agent + Send + 'stat
         constrained: bool,
         writebuf: &mut CryptoVec,
     ) -> Result<bool, Error> {
-        #[cfg(feature = "rs-crypto")]
-        let pos0 = r.position;
-        let t = r.read_string()?;
-        let (blob, key) = match t {
-            #[cfg(feature = "rs-crypto")]
-            b"ssh-ed25519" => {
-                let public_ = r.read_string()?;
-                let pos1 = r.position;
-                let concat = r.read_string()?;
-                let _comment = r.read_string()?;
-                #[allow(clippy::indexing_slicing)] // length checked before
-                let public = ed25519_dalek::PublicKey::from_bytes(
-                    public_.get(..32).ok_or(Error::KeyIsCorrupt)?,
-                )?;
-                let secret = ed25519_dalek::SecretKey::from_bytes(
-                    concat.get(..32).ok_or(Error::KeyIsCorrupt)?,
-                )?;
+        let (blob, key_pair) = {
+            use ssh_encoding::{Decode, Encode};
 
-                writebuf.push(msg::SUCCESS);
+            let private_key = ssh_key::private::PrivateKey::new(
+                ssh_key::private::KeypairData::decode(&mut r)?,
+                "",
+            )?;
+            let _comment = r.read_string()?;
+            let key_pair = key::KeyPair::try_from(&private_key)?;
 
-                #[allow(clippy::indexing_slicing)] // positions checked before
-                (
-                    self.buf[pos0..pos1].to_vec(),
-                    key::KeyPair::Ed25519(ed25519_dalek::Keypair { public, secret }),
-                )
-            }
-            #[cfg(feature = "openssl")]
-            b"ssh-rsa" => {
-                use openssl::bn::{BigNum, BigNumContext};
-                use openssl::rsa::Rsa;
-                let n = r.read_mpint()?;
-                let e = r.read_mpint()?;
-                let d = BigNum::from_slice(r.read_mpint()?)?;
-                let q_inv = r.read_mpint()?;
-                let p = BigNum::from_slice(r.read_mpint()?)?;
-                let q = BigNum::from_slice(r.read_mpint()?)?;
-                let (dp, dq) = {
-                    let one = BigNum::from_u32(1)?;
-                    let p1 = p.as_ref() - one.as_ref();
-                    let q1 = q.as_ref() - one.as_ref();
-                    let mut context = BigNumContext::new()?;
-                    let mut dp = BigNum::new()?;
-                    let mut dq = BigNum::new()?;
-                    dp.checked_rem(&d, &p1, &mut context)?;
-                    dq.checked_rem(&d, &q1, &mut context)?;
-                    (dp, dq)
-                };
-                let _comment = r.read_string()?;
-                let key = Rsa::from_private_components(
-                    BigNum::from_slice(n)?,
-                    BigNum::from_slice(e)?,
-                    d,
-                    p,
-                    q,
-                    dp,
-                    dq,
-                    BigNum::from_slice(q_inv)?,
-                )?;
+            let mut blob = Vec::new();
+            private_key.public_key().key_data().encode(&mut blob)?;
 
-                let len0 = writebuf.len();
-                writebuf.extend_ssh_string(b"ssh-rsa");
-                writebuf.extend_ssh_mpint(e);
-                writebuf.extend_ssh_mpint(n);
-
-                #[allow(clippy::indexing_slicing)] // length is known
-                let blob = writebuf[len0..].to_vec();
-                writebuf.resize(len0);
-                writebuf.push(msg::SUCCESS);
-                (
-                    blob,
-                    key::KeyPair::RSA {
-                        key,
-                        hash: SignatureHash::SHA2_256,
-                    },
-                )
-            }
-            _ => return Ok(false),
+            (blob, key_pair)
         };
+        writebuf.push(msg::SUCCESS);
         let mut w = self.keys.0.write().or(Err(Error::AgentFailure))?;
         let now = SystemTime::now();
         if constrained {
-            let n = r.read_u32()?;
             let mut c = Vec::new();
-            for _ in 0..n {
-                let t = r.read_byte()?;
+            while let Ok(t) = r.read_byte() {
                 if t == msg::CONSTRAIN_LIFETIME {
                     let seconds = r.read_u32()?;
                     c.push(Constraint::KeyLifetime { seconds });
@@ -342,9 +295,9 @@ impl<S: AsyncRead + AsyncWrite + Send + Unpin + 'static, A: Agent + Send + 'stat
                     return Ok(false);
                 }
             }
-            w.insert(blob, (Arc::new(key), now, Vec::new()));
+            w.insert(blob, (Arc::new(key_pair), now, c));
         } else {
-            w.insert(blob, (Arc::new(key), now, Vec::new()));
+            w.insert(blob, (Arc::new(key_pair), now, Vec::new()));
         }
         Ok(true)
     }

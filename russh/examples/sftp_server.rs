@@ -1,12 +1,14 @@
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
+
 use async_trait::async_trait;
 use log::{error, info, LevelFilter};
-use russh::{
-    server::{Auth, Msg, Session},
-    Channel, ChannelId,
-};
+use russh::server::{Auth, Msg, Server as _, Session};
+use russh::{Channel, ChannelId};
 use russh_keys::key::KeyPair;
 use russh_sftp::protocol::{File, FileAttributes, Handle, Name, Status, StatusCode, Version};
-use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::sync::Mutex;
 
 #[derive(Clone)]
@@ -43,38 +45,38 @@ impl SshSession {
 impl russh::server::Handler for SshSession {
     type Error = anyhow::Error;
 
-    async fn auth_password(self, user: &str, password: &str) -> Result<(Self, Auth), Self::Error> {
+    async fn auth_password(&mut self, user: &str, password: &str) -> Result<Auth, Self::Error> {
         info!("credentials: {}, {}", user, password);
-        Ok((self, Auth::Accept))
+        Ok(Auth::Accept)
     }
 
     async fn auth_publickey(
-        self,
+        &mut self,
         user: &str,
         public_key: &russh_keys::key::PublicKey,
-    ) -> Result<(Self, Auth), Self::Error> {
+    ) -> Result<Auth, Self::Error> {
         info!("credentials: {}, {:?}", user, public_key);
-        Ok((self, Auth::Accept))
+        Ok(Auth::Accept)
     }
 
     async fn channel_open_session(
-        mut self,
+        &mut self,
         channel: Channel<Msg>,
-        session: Session,
-    ) -> Result<(Self, bool, Session), Self::Error> {
+        _session: &mut Session,
+    ) -> Result<bool, Self::Error> {
         {
             let mut clients = self.clients.lock().await;
             clients.insert(channel.id(), channel);
         }
-        Ok((self, true, session))
+        Ok(true)
     }
 
     async fn subsystem_request(
-        mut self,
+        &mut self,
         channel_id: ChannelId,
         name: &str,
-        mut session: Session,
-    ) -> Result<(Self, Session), Self::Error> {
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
         info!("subsystem: {}", name);
 
         if name == "sftp" {
@@ -86,7 +88,7 @@ impl russh::server::Handler for SshSession {
             session.channel_failure(channel_id);
         }
 
-        Ok((self, session))
+        Ok(())
     }
 }
 
@@ -143,10 +145,12 @@ impl russh_sftp::server::Handler for SftpSession {
                 files: vec![
                     File {
                         filename: "foo".to_string(),
+                        longname: "".to_string(),
                         attrs: FileAttributes::default(),
                     },
                     File {
                         filename: "bar".to_string(),
+                        longname: "".to_string(),
                         attrs: FileAttributes::default(),
                     },
                 ],
@@ -161,6 +165,7 @@ impl russh_sftp::server::Handler for SftpSession {
             id,
             files: vec![File {
                 filename: "/".to_string(),
+                longname: "".to_string(),
                 attrs: FileAttributes::default(),
             }],
         })
@@ -176,26 +181,25 @@ async fn main() {
     let config = russh::server::Config {
         auth_rejection_time: Duration::from_secs(3),
         auth_rejection_time_initial: Some(Duration::from_secs(0)),
-        keys: vec![generate_keypair()],
-        connection_timeout: Some(Duration::from_secs(3600)),
+        keys: vec![KeyPair::generate_ed25519().unwrap()],
         ..Default::default()
     };
 
-    let server = Server;
+    let mut server = Server;
 
-    russh::server::run(
-        Arc::new(config),
-        (
-            "0.0.0.0",
-            std::env::var("PORT")
-                .unwrap_or("22".to_string())
-                .parse()
-                .unwrap(),
-        ),
-        server,
-    )
-    .await
-    .unwrap();
+    server
+        .run_on_address(
+            Arc::new(config),
+            (
+                "0.0.0.0",
+                std::env::var("PORT")
+                    .unwrap_or("22".to_string())
+                    .parse()
+                    .unwrap(),
+            ),
+        )
+        .await
+        .unwrap();
 }
 
 #[cfg(feature = "rs-crypto")]
